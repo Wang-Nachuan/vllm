@@ -69,6 +69,18 @@ class CPUOffloadingManager(OffloadingManager):
     def _get_num_free_blocks(self) -> int:
         return len(self._free_list) + self._num_blocks - self._num_allocated_blocks
 
+    def _get_num_cached_blocks(self) -> int:
+        if hasattr(self._policy, "blocks"):
+            return len(self._policy.blocks)
+        if hasattr(self._policy, "t1") and hasattr(self._policy, "t2"):
+            return len(self._policy.t1) + len(self._policy.t2)
+        raise NotImplementedError(
+            f"Unknown cache policy storage for {type(self._policy).__name__}"
+        )
+
+    def get_usage_stats(self) -> tuple[int, int]:
+        return self._get_num_cached_blocks(), self._num_blocks
+
     def _allocate_blocks(self, keys: list[OffloadKey]) -> list[BlockStatus]:
         num_fresh = min(len(keys), self._num_blocks - self._num_allocated_blocks)
         num_reused = len(keys) - num_fresh

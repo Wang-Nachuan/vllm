@@ -15,6 +15,8 @@ from vllm.v1.kv_offload.worker.worker import TransferType
 
 logger = init_logger(__name__)
 
+CPU_CACHE_USAGE_KEY = "cpu_cache_usage"
+
 
 @dataclass
 class OffloadingOperationMetrics:
@@ -30,11 +32,14 @@ class OffloadingConnectorStats(KVConnectorStats):
             self.reset()
 
     def reset(self):
-        self.data: dict[str, list[OffloadingOperationMetrics]] = {}
+        self.data: dict[str, Any] = {}
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
         if not other.is_empty():
             for k, v in other.data.items():
+                if k == CPU_CACHE_USAGE_KEY:
+                    self.data[k] = v
+                    continue
                 if k not in self.data:
                     self.data[k] = v
                 else:
@@ -52,6 +57,12 @@ class OffloadingConnectorStats(KVConnectorStats):
         """
         return_dict: dict[str, int | float] = {}
         for transfer_type, ops_list in self.data.items():
+            if transfer_type == CPU_CACHE_USAGE_KEY:
+                assert isinstance(ops_list, dict)
+                return_dict["cpu_cache_usage_perc"] = ops_list["usage_perc"]
+                return_dict["cpu_cache_used_blocks"] = ops_list["used_blocks"]
+                return_dict["cpu_cache_total_blocks"] = ops_list["total_blocks"]
+                continue
             assert isinstance(ops_list, list)
             total_bytes = 0
             total_time = 0.0
@@ -75,6 +86,19 @@ class OffloadingConnectorStats(KVConnectorStats):
         else:
             self.data[transfer_type_key] = [op]
 
+    def record_cpu_cache_usage(
+        self,
+        *,
+        used_blocks: int,
+        total_blocks: int,
+    ):
+        usage_perc = used_blocks / total_blocks if total_blocks else 0.0
+        self.data[CPU_CACHE_USAGE_KEY] = {
+            "used_blocks": used_blocks,
+            "total_blocks": total_blocks,
+            "usage_perc": usage_perc,
+        }
+
 
 class OffloadPromMetrics(KVConnectorPromMetrics):
     def __init__(
@@ -89,6 +113,18 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         self.histogram_transfer_size: dict[tuple[int, str], PromMetricT] = {}
         self.counter_kv_bytes: dict[tuple[int, str], PromMetricT] = {}
         self.counter_kv_transfer_time: dict[tuple[int, str], PromMetricT] = {}
+        gauge_cpu_cache_usage = self._gauge_cls(
+            name="vllm:kv_offload_cpu_cache_usage_perc",
+            documentation=(
+                "CPU KV offload cache usage. 1 means 100 percent usage."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_cpu_cache_usage = {
+            idx: gauge_cpu_cache_usage.labels(*values)
+            for idx, values in per_engine_labelvalues.items()
+        }
         buckets = [  # In bytes
             1e6,
             5e6,
@@ -130,6 +166,10 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         """
 
         for transfer_type, ops in transfer_stats_data.items():
+            if transfer_type == CPU_CACHE_USAGE_KEY:
+                assert isinstance(ops, dict)
+                self.gauge_cpu_cache_usage[engine_idx].set(ops["usage_perc"])
+                continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:
                 self.histogram_transfer_size[(engine_idx, transfer_type)] = (

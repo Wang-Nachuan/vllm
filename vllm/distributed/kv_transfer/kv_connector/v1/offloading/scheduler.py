@@ -14,6 +14,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     ReqId,
     TransferJob,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -1046,6 +1049,17 @@ class OffloadingConnectorScheduler:
                     medium=event.medium,
                     lora_name=None,
                 )
+
+    def get_kv_connector_stats(self) -> OffloadingConnectorStats | None:
+        if not hasattr(self.manager, "get_usage_stats"):
+            return None
+        used_blocks, total_blocks = self.manager.get_usage_stats()
+        stats = OffloadingConnectorStats()
+        stats.record_cpu_cache_usage(
+            used_blocks=used_blocks,
+            total_blocks=total_blocks,
+        )
+        return stats
 
     def reset_cache(self) -> None:
         """Reset the offloading manager cache, evicting all stored blocks."""
