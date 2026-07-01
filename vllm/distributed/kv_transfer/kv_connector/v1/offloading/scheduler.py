@@ -1051,15 +1051,23 @@ class OffloadingConnectorScheduler:
                 )
 
     def get_kv_connector_stats(self) -> OffloadingConnectorStats | None:
-        if not hasattr(self.manager, "get_usage_stats"):
-            return None
-        used_blocks, total_blocks = self.manager.get_usage_stats()
         stats = OffloadingConnectorStats()
-        stats.record_cpu_cache_usage(
-            used_blocks=used_blocks,
-            total_blocks=total_blocks,
-        )
-        return stats
+        if hasattr(self.manager, "get_usage_stats"):
+            used_blocks, total_blocks = self.manager.get_usage_stats()
+            stats.record_cpu_cache_usage(
+                used_blocks=used_blocks,
+                total_blocks=total_blocks,
+            )
+        if hasattr(self.manager, "take_secondary_tier_stats"):
+            secondary_tier_stats = self.manager.take_secondary_tier_stats()
+            stats.record_secondary_tier_stats(secondary_tier_stats)
+        if hasattr(self.manager, "take_tiering_lookup_stats"):
+            tiering_lookup_stats = self.manager.take_tiering_lookup_stats()
+            stats.record_tiering_lookup_stats(tiering_lookup_stats)
+        if hasattr(self.manager, "take_primary_eviction_stats"):
+            primary_eviction_stats = self.manager.take_primary_eviction_stats()
+            stats.record_primary_eviction_stats(primary_eviction_stats)
+        return None if stats.is_empty() else stats
 
     def reset_cache(self) -> None:
         """Reset the offloading manager cache, evicting all stored blocks."""

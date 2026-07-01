@@ -16,6 +16,9 @@ from vllm.v1.kv_offload.worker.worker import TransferType
 logger = init_logger(__name__)
 
 CPU_CACHE_USAGE_KEY = "cpu_cache_usage"
+SECONDARY_TIER_STATS_KEY = "secondary_tier_stats"
+TIERING_LOOKUP_STATS_KEY = "tiering_lookup_stats"
+PRIMARY_EVICTION_STATS_KEY = "primary_eviction_stats"
 
 
 @dataclass
@@ -40,6 +43,15 @@ class OffloadingConnectorStats(KVConnectorStats):
                 if k == CPU_CACHE_USAGE_KEY:
                     self.data[k] = v
                     continue
+                if k == SECONDARY_TIER_STATS_KEY:
+                    self._aggregate_secondary_tier_stats(v)
+                    continue
+                if k == TIERING_LOOKUP_STATS_KEY:
+                    self._aggregate_tiering_lookup_stats(v)
+                    continue
+                if k == PRIMARY_EVICTION_STATS_KEY:
+                    self._aggregate_primary_eviction_stats(v)
+                    continue
                 if k not in self.data:
                     self.data[k] = v
                 else:
@@ -47,6 +59,34 @@ class OffloadingConnectorStats(KVConnectorStats):
                     assert isinstance(accumulator, list)
                     accumulator.extend(v)
         return self
+
+    def _aggregate_secondary_tier_stats(self, stats: dict[str, Any]) -> None:
+        accumulator = self.data.setdefault(SECONDARY_TIER_STATS_KEY, {})
+        assert isinstance(accumulator, dict)
+        for operation, operation_stats in stats.items():
+            assert isinstance(operation_stats, dict)
+            output_operation_stats = accumulator.setdefault(operation, {})
+            assert isinstance(output_operation_stats, dict)
+            for name, value in operation_stats.items():
+                output_operation_stats[name] = (
+                    output_operation_stats.get(name, 0) + value
+                )
+
+    def _aggregate_tiering_lookup_stats(self, stats: dict[str, int]) -> None:
+        accumulator = self.data.setdefault(TIERING_LOOKUP_STATS_KEY, {})
+        assert isinstance(accumulator, dict)
+        for name, value in stats.items():
+            accumulator[name] = accumulator.get(name, 0) + value
+
+    def _aggregate_primary_eviction_stats(self, stats: dict[str, Any]) -> None:
+        accumulator = self.data.setdefault(PRIMARY_EVICTION_STATS_KEY, {})
+        assert isinstance(accumulator, dict)
+        for cause, cause_stats in stats.items():
+            assert isinstance(cause_stats, dict)
+            output_cause_stats = accumulator.setdefault(cause, {})
+            assert isinstance(output_cause_stats, dict)
+            for name, value in cause_stats.items():
+                output_cause_stats[name] = output_cause_stats.get(name, 0) + value
 
     def reduce(self) -> dict[str, int | float]:
         """
@@ -62,6 +102,25 @@ class OffloadingConnectorStats(KVConnectorStats):
                 return_dict["cpu_cache_usage_perc"] = ops_list["usage_perc"]
                 return_dict["cpu_cache_used_blocks"] = ops_list["used_blocks"]
                 return_dict["cpu_cache_total_blocks"] = ops_list["total_blocks"]
+                continue
+            if transfer_type == SECONDARY_TIER_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for operation, operation_stats in ops_list.items():
+                    assert isinstance(operation_stats, dict)
+                    for name, value in operation_stats.items():
+                        return_dict[f"secondary_tier_{operation}_{name}"] = value
+                continue
+            if transfer_type == TIERING_LOOKUP_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for name, value in ops_list.items():
+                    return_dict[f"tiering_lookup_{name}"] = value
+                continue
+            if transfer_type == PRIMARY_EVICTION_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for cause, cause_stats in ops_list.items():
+                    assert isinstance(cause_stats, dict)
+                    for name, value in cause_stats.items():
+                        return_dict[f"primary_eviction_{cause}_{name}"] = value
                 continue
             assert isinstance(ops_list, list)
             total_bytes = 0
@@ -99,6 +158,21 @@ class OffloadingConnectorStats(KVConnectorStats):
             "usage_perc": usage_perc,
         }
 
+    def record_secondary_tier_stats(self, stats: dict[str, dict[str, int]]) -> None:
+        if not stats:
+            return
+        self._aggregate_secondary_tier_stats(stats)
+
+    def record_tiering_lookup_stats(self, stats: dict[str, int]) -> None:
+        if not stats:
+            return
+        self._aggregate_tiering_lookup_stats(stats)
+
+    def record_primary_eviction_stats(self, stats: dict[str, dict[str, int]]) -> None:
+        if not stats:
+            return
+        self._aggregate_primary_eviction_stats(stats)
+
 
 class OffloadPromMetrics(KVConnectorPromMetrics):
     def __init__(
@@ -113,6 +187,20 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         self.histogram_transfer_size: dict[tuple[int, str], PromMetricT] = {}
         self.counter_kv_bytes: dict[tuple[int, str], PromMetricT] = {}
         self.counter_kv_transfer_time: dict[tuple[int, str], PromMetricT] = {}
+        self.counter_secondary_tier_jobs: dict[tuple[int, str, str], PromMetricT] = {}
+        self.counter_secondary_tier_blocks: dict[
+            tuple[int, str, str], PromMetricT
+        ] = {}
+        self.counter_tiering_lookup_total_blocks: dict[int, PromMetricT] = {}
+        self.counter_tiering_lookup_result_blocks: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        self.counter_primary_eviction_events: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        self.counter_primary_eviction_blocks: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
         gauge_cpu_cache_usage = self._gauge_cls(
             name="vllm:kv_offload_cpu_cache_usage_perc",
             documentation=(
@@ -150,6 +238,46 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             labelnames=labelnames + ["transfer_type"],
         )
 
+        self._counter_secondary_tier_jobs = self._counter_cls(
+            name="vllm:kv_offload_secondary_tier_jobs",
+            documentation="Number of secondary tier KV offload jobs",
+            labelnames=labelnames + ["operation", "status"],
+        )
+
+        self._counter_secondary_tier_blocks = self._counter_cls(
+            name="vllm:kv_offload_secondary_tier_blocks",
+            documentation="Number of blocks in secondary tier KV offload jobs",
+            labelnames=labelnames + ["operation", "status"],
+        )
+
+        counter_tiering_lookup_total_blocks = self._counter_cls(
+            name="vllm:kv_offload_tiering_lookup_total_blocks",
+            documentation="Number of tiering KV offload block lookup attempts",
+            labelnames=labelnames,
+        )
+        self.counter_tiering_lookup_total_blocks = {
+            idx: counter_tiering_lookup_total_blocks.labels(*values)
+            for idx, values in per_engine_labelvalues.items()
+        }
+
+        self._counter_tiering_lookup_result_blocks = self._counter_cls(
+            name="vllm:kv_offload_tiering_lookup_result_blocks",
+            documentation="Number of tiering KV offload block lookup results",
+            labelnames=labelnames + ["result"],
+        )
+
+        self._counter_primary_eviction_events = self._counter_cls(
+            name="vllm:kv_offload_primary_eviction_events",
+            documentation="Number of CPU primary tier eviction events by cause",
+            labelnames=labelnames + ["cause"],
+        )
+
+        self._counter_primary_eviction_blocks = self._counter_cls(
+            name="vllm:kv_offload_primary_eviction_blocks",
+            documentation="Number of CPU primary tier blocks evicted by cause",
+            labelnames=labelnames + ["cause"],
+        )
+
         self._histogram_transfer_size = self._histogram_cls(
             name="vllm:kv_offload_size",
             documentation="Histogram of KV offload transfer size, in bytes.",
@@ -169,6 +297,15 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             if transfer_type == CPU_CACHE_USAGE_KEY:
                 assert isinstance(ops, dict)
                 self.gauge_cpu_cache_usage[engine_idx].set(ops["usage_perc"])
+                continue
+            if transfer_type == SECONDARY_TIER_STATS_KEY:
+                self._observe_secondary_tier_stats(ops, engine_idx)
+                continue
+            if transfer_type == TIERING_LOOKUP_STATS_KEY:
+                self._observe_tiering_lookup_stats(ops, engine_idx)
+                continue
+            if transfer_type == PRIMARY_EVICTION_STATS_KEY:
+                self._observe_primary_eviction_stats(ops, engine_idx)
                 continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:
@@ -203,3 +340,84 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 self.counter_kv_transfer_time[(engine_idx, transfer_type)].inc(
                     op["op_time"]
                 )
+
+    def _observe_secondary_tier_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        for operation, operation_stats in stats.items():
+            assert isinstance(operation_stats, dict)
+            for name, value in operation_stats.items():
+                if name.endswith("_jobs"):
+                    status = name.removesuffix("_jobs")
+                    counter_key = (engine_idx, operation, status)
+                    if counter_key not in self.counter_secondary_tier_jobs:
+                        self.counter_secondary_tier_jobs[counter_key] = (
+                            self._counter_secondary_tier_jobs.labels(
+                                *(
+                                    self.per_engine_labelvalues[engine_idx]
+                                    + [operation, status]
+                                )
+                            )
+                        )
+                    self.counter_secondary_tier_jobs[counter_key].inc(value)
+                elif name.endswith("_blocks"):
+                    status = name.removesuffix("_blocks")
+                    counter_key = (engine_idx, operation, status)
+                    if counter_key not in self.counter_secondary_tier_blocks:
+                        self.counter_secondary_tier_blocks[counter_key] = (
+                            self._counter_secondary_tier_blocks.labels(
+                                *(
+                                    self.per_engine_labelvalues[engine_idx]
+                                    + [operation, status]
+                                )
+                            )
+                        )
+                    self.counter_secondary_tier_blocks[counter_key].inc(value)
+
+    def _observe_tiering_lookup_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        total_blocks = stats.get("total_blocks")
+        if total_blocks:
+            self.counter_tiering_lookup_total_blocks[engine_idx].inc(total_blocks)
+
+        for name, value in stats.items():
+            if name == "total_blocks" or not name.endswith("_blocks"):
+                continue
+            result = name.removesuffix("_blocks")
+            counter_key = (engine_idx, result)
+            if counter_key not in self.counter_tiering_lookup_result_blocks:
+                self.counter_tiering_lookup_result_blocks[counter_key] = (
+                    self._counter_tiering_lookup_result_blocks.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [result])
+                    )
+                )
+            self.counter_tiering_lookup_result_blocks[counter_key].inc(value)
+
+    def _observe_primary_eviction_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        for cause, cause_stats in stats.items():
+            assert isinstance(cause_stats, dict)
+            counter_key = (engine_idx, cause)
+            if counter_key not in self.counter_primary_eviction_events:
+                self.counter_primary_eviction_events[counter_key] = (
+                    self._counter_primary_eviction_events.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [cause])
+                    )
+                )
+                self.counter_primary_eviction_blocks[counter_key] = (
+                    self._counter_primary_eviction_blocks.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [cause])
+                    )
+                )
+
+            events = cause_stats.get("events", 0)
+            blocks = cause_stats.get("blocks", 0)
+            if events:
+                self.counter_primary_eviction_events[counter_key].inc(events)
+            if blocks:
+                self.counter_primary_eviction_blocks[counter_key].inc(blocks)

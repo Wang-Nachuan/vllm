@@ -173,6 +173,195 @@ class TestTieringOffloadingManager:
         assert all(self.secondary_tier1.lookup(b, _CTX) for b in blocks)
         assert all(self.secondary_tier2.lookup(b, _CTX) for b in blocks)
 
+    def test_secondary_tier_stats_track_store_jobs(self, manager_setup):
+        """Secondary tier store counters are emitted as deltas."""
+        blocks = to_keys(range(3))
+
+        result = self.manager.prepare_store(blocks, _CTX)
+        assert result is not None
+        self.manager.complete_store(blocks, _CTX, success=True)
+
+        assert self.manager.take_secondary_tier_stats() == {
+            "store": {
+                "submitted_jobs": 2,
+                "submitted_blocks": 6,
+            }
+        }
+        assert self.manager.take_secondary_tier_stats() == {}
+
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        assert self.manager.take_secondary_tier_stats() == {
+            "store": {
+                "succeeded_jobs": 2,
+                "succeeded_blocks": 6,
+            }
+        }
+
+    def test_secondary_tier_stats_track_promotion_jobs(self, manager_setup):
+        """Secondary tier promotion counters are emitted as deltas."""
+        blocks = to_keys(range(3))
+        for block in blocks:
+            self.secondary_tier1.blocks[block] = True
+
+        for block in blocks:
+            assert self.manager.lookup(block, _CTX) is None
+
+        self._simulate_on_schedule_end()
+
+        assert self.manager.take_secondary_tier_stats() == {
+            "promotion": {
+                "submitted_jobs": 1,
+                "submitted_blocks": 3,
+            }
+        }
+
+        self._simulate_on_schedule_end()
+
+        assert self.manager.take_secondary_tier_stats() == {
+            "promotion": {
+                "succeeded_jobs": 1,
+                "succeeded_blocks": 3,
+            }
+        }
+
+    def test_tiering_lookup_stats_track_external_outcomes(self, manager_setup):
+        """Tiering lookup counters distinguish ready, pending, and miss."""
+        cpu_hit, secondary_hit, missing = to_keys(range(3))
+
+        self.manager.prepare_store([cpu_hit], _CTX)
+        self.manager.complete_store([cpu_hit], _CTX, success=True)
+        self.secondary_tier1.blocks[secondary_hit] = True
+
+        assert self.manager.lookup(cpu_hit, _CTX) is True
+        assert self.manager.lookup(secondary_hit, _CTX) is None
+        assert self.manager.lookup(missing, _CTX) is False
+        assert self.manager.lookup(secondary_hit, _CTX) is None
+
+        assert self.manager.take_tiering_lookup_stats() == {
+            "total_blocks": 4,
+            "cpu_lookup_blocks": 4,
+            "cpu_hit_ready_blocks": 1,
+            "cpu_hit_pending_blocks": 1,
+            "secondary_lookup_blocks": 3,
+            "secondary_hit_ready_blocks": 1,
+            "miss_blocks": 1,
+        }
+        assert self.manager.take_tiering_lookup_stats() == {}
+
+    def test_tiering_lookup_stats_track_secondary_pending(self, manager_setup):
+        """A pending secondary-tier lookup is counted separately."""
+        block = to_keys([99])[0]
+        self.secondary_tier1.lookup = MagicMock(return_value=None)
+        self.secondary_tier2.lookup = MagicMock(return_value=False)
+
+        assert self.manager.lookup(block, _CTX) is None
+
+        assert self.manager.take_tiering_lookup_stats() == {
+            "total_blocks": 1,
+            "cpu_lookup_blocks": 1,
+            "secondary_lookup_blocks": 2,
+            "secondary_hit_pending_blocks": 1,
+        }
+
+    def test_tiering_lookup_stats_track_pending_before_later_hit(
+        self, manager_setup
+    ):
+        """A pending tier result is counted even if a later tier hits."""
+        block = to_keys([99])[0]
+        self.secondary_tier1.lookup = MagicMock(return_value=None)
+        self.secondary_tier2.blocks[block] = True
+
+        assert self.manager.lookup(block, _CTX) is None
+
+        assert self.manager.take_tiering_lookup_stats() == {
+            "total_blocks": 1,
+            "cpu_lookup_blocks": 1,
+            "secondary_lookup_blocks": 2,
+            "secondary_hit_pending_blocks": 1,
+            "secondary_hit_ready_blocks": 1,
+        }
+
+    def test_tiering_lookup_stats_track_no_primary_slot(self, manager_setup):
+        """Secondary hit without an evictable primary slot is not a miss."""
+        primary_blocks = to_keys(range(5))
+        secondary_only_block = to_keys([99])[0]
+
+        result = self.manager.prepare_store(primary_blocks, _CTX)
+        assert result is not None
+        self.manager.complete_store(primary_blocks, _CTX, success=True)
+        self.secondary_tier1.blocks[secondary_only_block] = True
+
+        assert self.manager.lookup(secondary_only_block, _CTX) is False
+
+        assert self.manager.take_tiering_lookup_stats() == {
+            "total_blocks": 1,
+            "cpu_lookup_blocks": 1,
+            "secondary_lookup_blocks": 1,
+            "secondary_hit_but_no_primary_slot_blocks": 1,
+        }
+
+    def test_primary_eviction_stats_track_store_evictions(self, manager_setup):
+        """Primary eviction counters include GPU-to-primary store evictions."""
+        primary_blocks = to_keys(range(5))
+        more_blocks = to_keys(range(5, 7))
+
+        result = self.manager.prepare_store(primary_blocks, _CTX)
+        assert result is not None
+        self.manager.complete_store(primary_blocks, _CTX, success=True)
+
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        result = self.manager.prepare_store(more_blocks, _CTX)
+        assert result is not None
+        assert len(result.evicted_keys) == 2
+
+        assert self.manager.take_primary_eviction_stats() == {
+            "store": {
+                "events": 1,
+                "blocks": 2,
+            }
+        }
+        assert self.manager.take_primary_eviction_stats() == {}
+
+    def test_primary_eviction_stats_track_promotion_evictions(
+        self, manager_setup
+    ):
+        """Primary eviction counters include secondary-to-primary promotions."""
+        primary_blocks = to_keys(range(5))
+        secondary_only_block = to_keys([99])[0]
+
+        result = self.manager.prepare_store(primary_blocks, _CTX)
+        assert result is not None
+        self.manager.complete_store(primary_blocks, _CTX, success=True)
+
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        self.secondary_tier1.blocks[secondary_only_block] = True
+
+        assert self.manager.lookup(secondary_only_block, _CTX) is None
+
+        assert self.manager.take_primary_eviction_stats() == {
+            "promotion": {
+                "events": 1,
+                "blocks": 1,
+            }
+        }
+        assert self.manager.take_primary_eviction_stats() == {}
+
+    def test_get_usage_stats_forwards_primary_tier(self, manager_setup):
+        """Tiering manager reports primary CPU usage to offload metrics."""
+        assert self.manager.get_usage_stats() == (0, 5)
+
+        blocks = to_keys(range(2))
+        self.manager.prepare_store(blocks, _CTX)
+        self.manager.complete_store(blocks, _CTX, success=True)
+
+        assert self.manager.get_usage_stats() == (2, 5)
+
     def test_ref_cnt_protection_during_cascade(self, manager_setup):
         """Test that ref_cnt protects blocks during cascade."""
         blocks = to_keys(range(3))
