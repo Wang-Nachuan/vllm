@@ -1061,6 +1061,9 @@ class OffloadingConnectorScheduler:
         if hasattr(self.manager, "take_secondary_tier_stats"):
             secondary_tier_stats = self.manager.take_secondary_tier_stats()
             stats.record_secondary_tier_stats(secondary_tier_stats)
+        if hasattr(self.manager, "take_secondary_tier_job_latency_stats"):
+            latency_stats = self.manager.take_secondary_tier_job_latency_stats()
+            stats.record_secondary_tier_job_latency_stats(latency_stats)
         if hasattr(self.manager, "take_tiering_lookup_stats"):
             tiering_lookup_stats = self.manager.take_tiering_lookup_stats()
             stats.record_tiering_lookup_stats(tiering_lookup_stats)

@@ -17,6 +17,7 @@ logger = init_logger(__name__)
 
 CPU_CACHE_USAGE_KEY = "cpu_cache_usage"
 SECONDARY_TIER_STATS_KEY = "secondary_tier_stats"
+SECONDARY_TIER_JOB_LATENCY_STATS_KEY = "secondary_tier_job_latency_stats"
 TIERING_LOOKUP_STATS_KEY = "tiering_lookup_stats"
 PRIMARY_EVICTION_STATS_KEY = "primary_eviction_stats"
 
@@ -46,6 +47,9 @@ class OffloadingConnectorStats(KVConnectorStats):
                 if k == SECONDARY_TIER_STATS_KEY:
                     self._aggregate_secondary_tier_stats(v)
                     continue
+                if k == SECONDARY_TIER_JOB_LATENCY_STATS_KEY:
+                    self._aggregate_secondary_tier_job_latency_stats(v)
+                    continue
                 if k == TIERING_LOOKUP_STATS_KEY:
                     self._aggregate_tiering_lookup_stats(v)
                     continue
@@ -71,6 +75,22 @@ class OffloadingConnectorStats(KVConnectorStats):
                 output_operation_stats[name] = (
                     output_operation_stats.get(name, 0) + value
                 )
+
+    def _aggregate_secondary_tier_job_latency_stats(
+        self, stats: dict[str, Any]
+    ) -> None:
+        accumulator = self.data.setdefault(
+            SECONDARY_TIER_JOB_LATENCY_STATS_KEY, {}
+        )
+        assert isinstance(accumulator, dict)
+        for operation, operation_stats in stats.items():
+            assert isinstance(operation_stats, dict)
+            output_operation_stats = accumulator.setdefault(operation, {})
+            assert isinstance(output_operation_stats, dict)
+            for status, latencies in operation_stats.items():
+                output_latencies = output_operation_stats.setdefault(status, [])
+                assert isinstance(output_latencies, list)
+                output_latencies.extend(latencies)
 
     def _aggregate_tiering_lookup_stats(self, stats: dict[str, int]) -> None:
         accumulator = self.data.setdefault(TIERING_LOOKUP_STATS_KEY, {})
@@ -109,6 +129,19 @@ class OffloadingConnectorStats(KVConnectorStats):
                     assert isinstance(operation_stats, dict)
                     for name, value in operation_stats.items():
                         return_dict[f"secondary_tier_{operation}_{name}"] = value
+                continue
+            if transfer_type == SECONDARY_TIER_JOB_LATENCY_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for operation, operation_stats in ops_list.items():
+                    assert isinstance(operation_stats, dict)
+                    for status, latencies in operation_stats.items():
+                        assert isinstance(latencies, list)
+                        return_dict[
+                            f"secondary_tier_{operation}_{status}_latency_count"
+                        ] = len(latencies)
+                        return_dict[
+                            f"secondary_tier_{operation}_{status}_latency_sum"
+                        ] = sum(latencies)
                 continue
             if transfer_type == TIERING_LOOKUP_STATS_KEY:
                 assert isinstance(ops_list, dict)
@@ -163,6 +196,13 @@ class OffloadingConnectorStats(KVConnectorStats):
             return
         self._aggregate_secondary_tier_stats(stats)
 
+    def record_secondary_tier_job_latency_stats(
+        self, stats: dict[str, dict[str, list[float]]]
+    ) -> None:
+        if not stats:
+            return
+        self._aggregate_secondary_tier_job_latency_stats(stats)
+
     def record_tiering_lookup_stats(self, stats: dict[str, int]) -> None:
         if not stats:
             return
@@ -189,6 +229,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         self.counter_kv_transfer_time: dict[tuple[int, str], PromMetricT] = {}
         self.counter_secondary_tier_jobs: dict[tuple[int, str, str], PromMetricT] = {}
         self.counter_secondary_tier_blocks: dict[
+            tuple[int, str, str], PromMetricT
+        ] = {}
+        self.histogram_secondary_tier_job_latency: dict[
             tuple[int, str, str], PromMetricT
         ] = {}
         self.counter_tiering_lookup_total_blocks: dict[int, PromMetricT] = {}
@@ -225,6 +268,22 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             150e6,
             200e6,
         ]
+        latency_buckets = [
+            0.0005,
+            0.001,
+            0.002,
+            0.005,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1,
+            2,
+            5,
+            10,
+        ]
 
         self._counter_kv_bytes = self._counter_cls(
             name="vllm:kv_offload_total_bytes",
@@ -247,6 +306,13 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         self._counter_secondary_tier_blocks = self._counter_cls(
             name="vllm:kv_offload_secondary_tier_blocks",
             documentation="Number of blocks in secondary tier KV offload jobs",
+            labelnames=labelnames + ["operation", "status"],
+        )
+
+        self._histogram_secondary_tier_job_latency = self._histogram_cls(
+            name="vllm:kv_offload_secondary_tier_job_latency_seconds",
+            documentation="Histogram of secondary tier KV offload job latency.",
+            buckets=latency_buckets[:],
             labelnames=labelnames + ["operation", "status"],
         )
 
@@ -300,6 +366,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 continue
             if transfer_type == SECONDARY_TIER_STATS_KEY:
                 self._observe_secondary_tier_stats(ops, engine_idx)
+                continue
+            if transfer_type == SECONDARY_TIER_JOB_LATENCY_STATS_KEY:
+                self._observe_secondary_tier_job_latency_stats(ops, engine_idx)
                 continue
             if transfer_type == TIERING_LOOKUP_STATS_KEY:
                 self._observe_tiering_lookup_stats(ops, engine_idx)
@@ -374,6 +443,29 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                             )
                         )
                     self.counter_secondary_tier_blocks[counter_key].inc(value)
+
+    def _observe_secondary_tier_job_latency_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        for operation, operation_stats in stats.items():
+            assert isinstance(operation_stats, dict)
+            for status, latencies in operation_stats.items():
+                counter_key = (engine_idx, operation, status)
+                if counter_key not in self.histogram_secondary_tier_job_latency:
+                    self.histogram_secondary_tier_job_latency[counter_key] = (
+                        self._histogram_secondary_tier_job_latency.labels(
+                            *(
+                                self.per_engine_labelvalues[engine_idx]
+                                + [operation, status]
+                            )
+                        )
+                    )
+                assert isinstance(latencies, list)
+                for latency_s in latencies:
+                    self.histogram_secondary_tier_job_latency[counter_key].observe(
+                        latency_s
+                    )
 
     def _observe_tiering_lookup_stats(
         self, stats: dict[str, Any], engine_idx: int

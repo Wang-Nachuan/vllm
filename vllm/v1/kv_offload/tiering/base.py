@@ -29,6 +29,7 @@ class JobMetadata:
     block_ids: np.ndarray
     is_promotion: bool
     req_context: ReqContext
+    submitted_at_s: float = 0.0
 
 
 @dataclass

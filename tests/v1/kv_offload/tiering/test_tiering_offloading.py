@@ -12,7 +12,7 @@ These tests verify:
 """
 
 from collections.abc import Iterable
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -199,6 +199,29 @@ class TestTieringOffloadingManager:
             }
         }
 
+    def test_secondary_tier_job_latency_stats_track_store_jobs(
+        self, manager_setup
+    ):
+        """Secondary tier store job latencies are emitted as deltas."""
+        blocks = to_keys(range(3))
+
+        result = self.manager.prepare_store(blocks, _CTX)
+        assert result is not None
+        with patch(
+            "vllm.v1.kv_offload.tiering.manager.time.monotonic",
+            side_effect=[10.0, 20.0, 11.5, 22.5],
+        ):
+            self.manager.complete_store(blocks, _CTX, success=True)
+            self._simulate_on_schedule_end()
+            self._simulate_on_schedule_end()
+
+        assert self.manager.take_secondary_tier_job_latency_stats() == {
+            "store": {
+                "succeeded": [1.5, 2.5],
+            }
+        }
+        assert self.manager.take_secondary_tier_job_latency_stats() == {}
+
     def test_secondary_tier_stats_track_promotion_jobs(self, manager_setup):
         """Secondary tier promotion counters are emitted as deltas."""
         blocks = to_keys(range(3))
@@ -225,6 +248,31 @@ class TestTieringOffloadingManager:
                 "succeeded_blocks": 3,
             }
         }
+
+    def test_secondary_tier_job_latency_stats_track_promotion_jobs(
+        self, manager_setup
+    ):
+        """Secondary tier promotion job latencies are emitted as deltas."""
+        blocks = to_keys(range(3))
+        for block in blocks:
+            self.secondary_tier1.blocks[block] = True
+
+        for block in blocks:
+            assert self.manager.lookup(block, _CTX) is None
+
+        with patch(
+            "vllm.v1.kv_offload.tiering.manager.time.monotonic",
+            side_effect=[30.0, 31.25],
+        ):
+            self._simulate_on_schedule_end()
+            self._simulate_on_schedule_end()
+
+        assert self.manager.take_secondary_tier_job_latency_stats() == {
+            "promotion": {
+                "succeeded": [1.25],
+            }
+        }
+        assert self.manager.take_secondary_tier_job_latency_stats() == {}
 
     def test_tiering_lookup_stats_track_external_outcomes(self, manager_setup):
         """Tiering lookup counters distinguish ready, pending, and miss."""

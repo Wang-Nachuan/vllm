@@ -23,6 +23,7 @@ Key Design Principles:
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
+import time
 
 import numpy as np
 from typing_extensions import override
@@ -173,6 +174,9 @@ class TieringOffloadingManager(OffloadingManager):
         self._secondary_tier_stats: defaultdict[str, defaultdict[str, int]] = (
             defaultdict(lambda: defaultdict(int))
         )
+        self._secondary_tier_job_latency_stats: defaultdict[
+            str, defaultdict[str, list[float]]
+        ] = defaultdict(lambda: defaultdict(list))
         self._tiering_lookup_stats: defaultdict[str, int] = defaultdict(int)
         self._primary_eviction_stats: defaultdict[str, defaultdict[str, int]] = (
             defaultdict(lambda: defaultdict(int))
@@ -191,6 +195,13 @@ class TieringOffloadingManager(OffloadingManager):
         stats[f"{status}_jobs"] += 1
         stats[f"{status}_blocks"] += block_count
 
+    def _record_secondary_tier_job_latency(
+        self, operation: str, status: str, latency_s: float
+    ) -> None:
+        self._secondary_tier_job_latency_stats[operation][status].append(
+            max(latency_s, 0.0)
+        )
+
     def take_secondary_tier_stats(self) -> dict[str, dict[str, int]]:
         """Return secondary tier job counters accumulated since the last call."""
         if not self._secondary_tier_stats:
@@ -200,6 +211,24 @@ class TieringOffloadingManager(OffloadingManager):
             for operation, operation_stats in self._secondary_tier_stats.items()
         }
         self._secondary_tier_stats.clear()
+        return stats
+
+    def take_secondary_tier_job_latency_stats(
+        self,
+    ) -> dict[str, dict[str, list[float]]]:
+        """Return secondary tier job latencies accumulated since last call."""
+        if not self._secondary_tier_job_latency_stats:
+            return {}
+        stats = {
+            operation: {
+                status: list(latencies)
+                for status, latencies in operation_stats.items()
+            }
+            for operation, operation_stats in (
+                self._secondary_tier_job_latency_stats.items()
+            )
+        }
+        self._secondary_tier_job_latency_stats.clear()
         return stats
 
     def _record_tiering_lookup_total(self) -> None:
@@ -272,6 +301,8 @@ class TieringOffloadingManager(OffloadingManager):
                 )
 
                 if job_metadata.is_promotion:
+                    operation = "promotion"
+                    status = "succeeded" if completed_job.success else "failed"
                     # secondary→primary transfer (promotion) completed.
                     # Make blocks available in primary tier.
                     self.primary_tier.complete_write(
@@ -280,21 +311,28 @@ class TieringOffloadingManager(OffloadingManager):
                         completed_job.success,
                     )
                     self._record_secondary_tier_job(
-                        "promotion",
-                        "succeeded" if completed_job.success else "failed",
+                        operation,
+                        status,
                         len(job_metadata.keys),
                     )
                 else:
+                    operation = "store"
+                    status = "succeeded" if completed_job.success else "failed"
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
                     self.primary_tier.complete_read(
                         job_metadata.keys, job_metadata.req_context
                     )
                     self._record_secondary_tier_job(
-                        "store",
-                        "succeeded" if completed_job.success else "failed",
+                        operation,
+                        status,
                         len(job_metadata.keys),
                     )
+                self._record_secondary_tier_job_latency(
+                    operation,
+                    status,
+                    time.monotonic() - job_metadata.submitted_at_s,
+                )
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
@@ -421,6 +459,7 @@ class TieringOffloadingManager(OffloadingManager):
                     block_ids=np.array(entry.block_ids, dtype=np.int64),
                     is_promotion=True,
                     req_context=entry.req_context,
+                    submitted_at_s=time.monotonic(),
                 )
                 self._transfer_jobs[job_id] = job_metadata
                 tier.submit_load(job_metadata)
@@ -563,6 +602,7 @@ class TieringOffloadingManager(OffloadingManager):
                 block_ids=primary_blocks_spec.block_ids,
                 is_promotion=False,
                 req_context=req_context,
+                submitted_at_s=time.monotonic(),
             )
             self._transfer_jobs[job_id] = job_metadata
             tier.submit_store(job_metadata)
@@ -621,6 +661,7 @@ class TieringOffloadingManager(OffloadingManager):
                 block_ids=primary_blocks_spec.block_ids,
                 is_promotion=False,
                 req_context=req_context,
+                submitted_at_s=time.monotonic(),
             )
             self._transfer_jobs[job_id] = job_metadata
 

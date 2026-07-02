@@ -146,6 +146,48 @@ def test_aggregate_secondary_tier_stats():
     assert reduced["secondary_tier_promotion_succeeded_blocks"] == 2
 
 
+def test_aggregate_secondary_tier_job_latency_stats():
+    """Test that secondary tier job latencies are preserved for histograms."""
+    stats1 = OffloadingConnectorStats()
+    stats1.record_secondary_tier_job_latency_stats(
+        {
+            "store": {
+                "succeeded": [0.01, 0.02],
+            },
+            "promotion": {
+                "succeeded": [0.03],
+            },
+        }
+    )
+
+    stats2 = OffloadingConnectorStats()
+    stats2.record_secondary_tier_job_latency_stats(
+        {
+            "store": {
+                "succeeded": [0.04],
+                "failed": [0.05],
+            },
+            "promotion": {
+                "failed": [0.06],
+            },
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["secondary_tier_store_succeeded_latency_count"] == 3
+    assert (
+        abs(reduced["secondary_tier_store_succeeded_latency_sum"] - 0.07)
+        < 1e-12
+    )
+    assert reduced["secondary_tier_store_failed_latency_count"] == 1
+    assert reduced["secondary_tier_store_failed_latency_sum"] == 0.05
+    assert reduced["secondary_tier_promotion_succeeded_latency_count"] == 1
+    assert reduced["secondary_tier_promotion_succeeded_latency_sum"] == 0.03
+    assert reduced["secondary_tier_promotion_failed_latency_count"] == 1
+    assert reduced["secondary_tier_promotion_failed_latency_sum"] == 0.06
+
+
 def test_aggregate_tiering_lookup_stats():
     """Test that tiering lookup counters are summed across observations."""
     stats1 = OffloadingConnectorStats()
