@@ -177,6 +177,9 @@ class TieringOffloadingManager(OffloadingManager):
         self._secondary_tier_job_latency_stats: defaultdict[
             str, defaultdict[str, list[float]]
         ] = defaultdict(lambda: defaultdict(list))
+        self._secondary_tier_task_runtime_stats: defaultdict[
+            str, defaultdict[str, defaultdict[str, float]]
+        ] = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
         self._tiering_lookup_stats: defaultdict[str, int] = defaultdict(int)
         self._primary_eviction_stats: defaultdict[str, defaultdict[str, int]] = (
             defaultdict(lambda: defaultdict(int))
@@ -201,6 +204,22 @@ class TieringOffloadingManager(OffloadingManager):
         self._secondary_tier_job_latency_stats[operation][status].append(
             max(latency_s, 0.0)
         )
+
+    def _record_secondary_tier_task_runtime(
+        self,
+        operation: str,
+        status: str,
+        *,
+        task_cpu_s: float,
+        task_wall_s: float,
+        task_count: int,
+    ) -> None:
+        if task_count <= 0 and task_cpu_s <= 0.0 and task_wall_s <= 0.0:
+            return
+        stats = self._secondary_tier_task_runtime_stats[operation][status]
+        stats["cpu_seconds"] += max(task_cpu_s, 0.0)
+        stats["wall_seconds"] += max(task_wall_s, 0.0)
+        stats["count"] += max(task_count, 0)
 
     def take_secondary_tier_stats(self) -> dict[str, dict[str, int]]:
         """Return secondary tier job counters accumulated since the last call."""
@@ -229,6 +248,24 @@ class TieringOffloadingManager(OffloadingManager):
             )
         }
         self._secondary_tier_job_latency_stats.clear()
+        return stats
+
+    def take_secondary_tier_task_runtime_stats(
+        self,
+    ) -> dict[str, dict[str, dict[str, float]]]:
+        """Return secondary tier worker task runtimes since last call."""
+        if not self._secondary_tier_task_runtime_stats:
+            return {}
+        stats = {
+            operation: {
+                status: dict(runtime_stats)
+                for status, runtime_stats in operation_stats.items()
+            }
+            for operation, operation_stats in (
+                self._secondary_tier_task_runtime_stats.items()
+            )
+        }
+        self._secondary_tier_task_runtime_stats.clear()
         return stats
 
     def _record_tiering_lookup_total(self) -> None:
@@ -332,6 +369,13 @@ class TieringOffloadingManager(OffloadingManager):
                     operation,
                     status,
                     time.monotonic() - job_metadata.submitted_at_s,
+                )
+                self._record_secondary_tier_task_runtime(
+                    operation,
+                    status,
+                    task_cpu_s=completed_job.task_cpu_s,
+                    task_wall_s=completed_job.task_wall_s,
+                    task_count=completed_job.task_count,
                 )
 
     @override

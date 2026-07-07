@@ -188,6 +188,59 @@ def test_aggregate_secondary_tier_job_latency_stats():
     assert reduced["secondary_tier_promotion_failed_latency_sum"] == 0.06
 
 
+def test_aggregate_secondary_tier_task_runtime_stats():
+    """Test that secondary tier task CPU/wall time counters are summed."""
+    stats1 = OffloadingConnectorStats()
+    stats1.record_secondary_tier_task_runtime_stats(
+        {
+            "store": {
+                "succeeded": {
+                    "cpu_seconds": 1.5,
+                    "wall_seconds": 4.0,
+                    "count": 3,
+                },
+            },
+            "promotion": {
+                "succeeded": {
+                    "cpu_seconds": 0.5,
+                    "wall_seconds": 2.0,
+                    "count": 1,
+                },
+            },
+        }
+    )
+
+    stats2 = OffloadingConnectorStats()
+    stats2.record_secondary_tier_task_runtime_stats(
+        {
+            "store": {
+                "succeeded": {
+                    "cpu_seconds": 0.25,
+                    "wall_seconds": 1.0,
+                    "count": 2,
+                },
+                "failed": {
+                    "cpu_seconds": 0.1,
+                    "wall_seconds": 0.4,
+                    "count": 1,
+                },
+            },
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["secondary_tier_store_succeeded_task_cpu_seconds"] == 1.75
+    assert reduced["secondary_tier_store_succeeded_task_wall_seconds"] == 5.0
+    assert reduced["secondary_tier_store_succeeded_task_count"] == 5
+    assert reduced["secondary_tier_store_failed_task_cpu_seconds"] == 0.1
+    assert reduced["secondary_tier_store_failed_task_wall_seconds"] == 0.4
+    assert reduced["secondary_tier_store_failed_task_count"] == 1
+    assert reduced["secondary_tier_promotion_succeeded_task_cpu_seconds"] == 0.5
+    assert reduced["secondary_tier_promotion_succeeded_task_wall_seconds"] == 2.0
+    assert reduced["secondary_tier_promotion_succeeded_task_count"] == 1
+
+
 def test_aggregate_tiering_lookup_stats():
     """Test that tiering lookup counters are summed across observations."""
     stats1 = OffloadingConnectorStats()

@@ -9,11 +9,12 @@ Thread pool:
 """
 
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.tiering.base import JobId
+from vllm.v1.kv_offload.tiering.base import JobId, JobResult
 
 logger = init_logger(__name__)
 
@@ -25,26 +26,49 @@ class JobState:
     Each task calls task_done(success) when it finishes.
     """
 
-    __slots__ = ("_job_id", "_n_tasks", "_completed", "_success", "_lock")
+    __slots__ = (
+        "_job_id",
+        "_n_tasks",
+        "_completed",
+        "_success",
+        "_task_cpu_s",
+        "_task_wall_s",
+        "_lock",
+    )
 
     def __init__(self, job_id: JobId, n_tasks: int) -> None:
         self._job_id: JobId = job_id
         self._n_tasks = n_tasks
         self._completed = 0
         self._success = True
+        self._task_cpu_s = 0.0
+        self._task_wall_s = 0.0
         self._lock = threading.Lock()
 
     @property
     def job_id(self) -> JobId:
         return self._job_id
 
-    def task_done(self, success: bool) -> tuple[bool, bool]:
+    def task_done(
+        self, success: bool, task_cpu_s: float, task_wall_s: float
+    ) -> tuple[bool, bool]:
         """Returns if job completed and success flag"""
         with self._lock:
             self._completed += 1
             if not success:
                 self._success = False
+            self._task_cpu_s += max(task_cpu_s, 0.0)
+            self._task_wall_s += max(task_wall_s, 0.0)
             return self._completed == self._n_tasks, self._success
+
+    def result(self) -> JobResult:
+        return JobResult(
+            job_id=self._job_id,
+            success=self._success,
+            task_cpu_s=self._task_cpu_s,
+            task_wall_s=self._task_wall_s,
+            task_count=self._completed,
+        )
 
 
 class DualQueueThreadPool:
@@ -67,7 +91,7 @@ class DualQueueThreadPool:
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
-        self._finished_q: deque[tuple[JobId, bool]] = deque()
+        self._finished_q: deque[JobResult] = deque()
 
         for i in range(n_read_threads):
             t = threading.Thread(
@@ -115,7 +139,7 @@ class DualQueueThreadPool:
                 self._store_q.append((fn, state))
             self._condition.notify(n_tasks)
 
-    def get_finished(self) -> list[tuple[JobId, bool]]:
+    def get_finished(self) -> list[JobResult]:
         jobs = []
         while self._finished_q:
             jobs.append(self._finished_q.popleft())
@@ -143,16 +167,24 @@ class DualQueueThreadPool:
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
                 task, state = primary.popleft() if primary else secondary.popleft()
+            wall_start = time.perf_counter()
+            cpu_start = time.thread_time()
+            success = True
             try:
                 task()
-                job_finished, success = state.task_done(True)
             except Exception as exc:
+                success = False
                 logger.error(
                     "Job %s block I/O failed: %s",
                     state.job_id,
                     exc,
                 )
-                job_finished, success = state.task_done(False)
+            finally:
+                task_cpu_s = time.thread_time() - cpu_start
+                task_wall_s = time.perf_counter() - wall_start
+                job_finished, _ = state.task_done(
+                    success, task_cpu_s, task_wall_s
+                )
 
             if job_finished:
-                self._finished_q.append((state.job_id, success))
+                self._finished_q.append(state.result())

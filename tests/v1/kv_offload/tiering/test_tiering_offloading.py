@@ -25,6 +25,7 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
+from vllm.v1.kv_offload.tiering.base import JobResult
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
@@ -222,6 +223,42 @@ class TestTieringOffloadingManager:
         }
         assert self.manager.take_secondary_tier_job_latency_stats() == {}
 
+    def test_secondary_tier_task_runtime_stats_track_store_jobs(
+        self, manager_setup
+    ):
+        """Secondary tier store task CPU/wall time is emitted as deltas."""
+        blocks = to_keys(range(3))
+
+        result = self.manager.prepare_store(blocks, _CTX)
+        assert result is not None
+        self.manager.complete_store(blocks, _CTX, success=True)
+        for tier, task_cpu_s, task_wall_s in (
+            (self.secondary_tier1, 0.6, 2.0),
+            (self.secondary_tier2, 0.9, 3.0),
+        ):
+            completed = tier.completed_jobs[0]
+            tier.completed_jobs[0] = JobResult(
+                job_id=completed.job_id,
+                success=completed.success,
+                task_cpu_s=task_cpu_s,
+                task_wall_s=task_wall_s,
+                task_count=3,
+            )
+
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        assert self.manager.take_secondary_tier_task_runtime_stats() == {
+            "store": {
+                "succeeded": {
+                    "cpu_seconds": 1.5,
+                    "wall_seconds": 5.0,
+                    "count": 6,
+                },
+            },
+        }
+        assert self.manager.take_secondary_tier_task_runtime_stats() == {}
+
     def test_secondary_tier_stats_track_promotion_jobs(self, manager_setup):
         """Secondary tier promotion counters are emitted as deltas."""
         blocks = to_keys(range(3))
@@ -273,6 +310,39 @@ class TestTieringOffloadingManager:
             }
         }
         assert self.manager.take_secondary_tier_job_latency_stats() == {}
+
+    def test_secondary_tier_task_runtime_stats_track_promotion_jobs(
+        self, manager_setup
+    ):
+        """Secondary tier promotion task CPU/wall time is emitted as deltas."""
+        blocks = to_keys(range(3))
+        for block in blocks:
+            self.secondary_tier1.blocks[block] = True
+
+        for block in blocks:
+            assert self.manager.lookup(block, _CTX) is None
+
+        self._simulate_on_schedule_end()
+        completed = self.secondary_tier1.completed_jobs[0]
+        self.secondary_tier1.completed_jobs[0] = JobResult(
+            job_id=completed.job_id,
+            success=completed.success,
+            task_cpu_s=0.25,
+            task_wall_s=1.25,
+            task_count=3,
+        )
+        self._simulate_on_schedule_end()
+
+        assert self.manager.take_secondary_tier_task_runtime_stats() == {
+            "promotion": {
+                "succeeded": {
+                    "cpu_seconds": 0.25,
+                    "wall_seconds": 1.25,
+                    "count": 3,
+                },
+            },
+        }
+        assert self.manager.take_secondary_tier_task_runtime_stats() == {}
 
     def test_tiering_lookup_stats_track_external_outcomes(self, manager_setup):
         """Tiering lookup counters distinguish ready, pending, and miss."""

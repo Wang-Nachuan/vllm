@@ -154,10 +154,7 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         Collect completed jobs from the finished-jobs queue.
         """
-        return (
-            JobResult(job_id=job_id, success=success)
-            for job_id, success in self._pool.get_finished()
-        )
+        return self._pool.get_finished()
 
     @override
     def shutdown(self) -> None:

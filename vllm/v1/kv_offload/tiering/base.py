@@ -38,6 +38,9 @@ class JobResult:
 
     job_id: JobId
     success: bool
+    task_cpu_s: float = 0.0
+    task_wall_s: float = 0.0
+    task_count: int = 0
 
 
 class SecondaryTierManager(ABC):
