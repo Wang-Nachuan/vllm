@@ -116,7 +116,9 @@ class OffloadingConnectorStats(KVConnectorStats):
                         output_runtime_stats.get(name, 0.0) + value
                     )
 
-    def _aggregate_tiering_lookup_stats(self, stats: dict[str, int]) -> None:
+    def _aggregate_tiering_lookup_stats(
+        self, stats: dict[str, int | float]
+    ) -> None:
         accumulator = self.data.setdefault(TIERING_LOOKUP_STATS_KEY, {})
         assert isinstance(accumulator, dict)
         for name, value in stats.items():
@@ -245,7 +247,7 @@ class OffloadingConnectorStats(KVConnectorStats):
             return
         self._aggregate_secondary_tier_task_runtime_stats(stats)
 
-    def record_tiering_lookup_stats(self, stats: dict[str, int]) -> None:
+    def record_tiering_lookup_stats(self, stats: dict[str, int | float]) -> None:
         if not stats:
             return
         self._aggregate_tiering_lookup_stats(stats)
@@ -287,6 +289,12 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         ] = {}
         self.counter_tiering_lookup_total_blocks: dict[int, PromMetricT] = {}
         self.counter_tiering_lookup_result_blocks: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        self.counter_tiering_lookup_wall_seconds: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        self.counter_tiering_lookup_cpu_seconds: dict[
             tuple[int, str], PromMetricT
         ] = {}
         self.counter_primary_eviction_events: dict[
@@ -405,6 +413,22 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             name="vllm:kv_offload_tiering_lookup_result_blocks",
             documentation="Number of tiering KV offload block lookup results",
             labelnames=labelnames + ["result"],
+        )
+
+        self._counter_tiering_lookup_wall_seconds = self._counter_cls(
+            name="vllm:kv_offload_tiering_lookup_wall_seconds",
+            documentation=(
+                "Total wall time spent in tiering KV offload lookup by tier."
+            ),
+            labelnames=labelnames + ["tier"],
+        )
+
+        self._counter_tiering_lookup_cpu_seconds = self._counter_cls(
+            name="vllm:kv_offload_tiering_lookup_cpu_seconds",
+            documentation=(
+                "Total thread CPU time spent in tiering KV offload lookup by tier."
+            ),
+            labelnames=labelnames + ["tier"],
         )
 
         self._counter_primary_eviction_events = self._counter_cls(
@@ -596,17 +620,38 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             self.counter_tiering_lookup_total_blocks[engine_idx].inc(total_blocks)
 
         for name, value in stats.items():
-            if name == "total_blocks" or not name.endswith("_blocks"):
+            if name == "total_blocks":
                 continue
-            result = name.removesuffix("_blocks")
-            counter_key = (engine_idx, result)
-            if counter_key not in self.counter_tiering_lookup_result_blocks:
-                self.counter_tiering_lookup_result_blocks[counter_key] = (
-                    self._counter_tiering_lookup_result_blocks.labels(
-                        *(self.per_engine_labelvalues[engine_idx] + [result])
+            if name.endswith("_blocks"):
+                result = name.removesuffix("_blocks")
+                counter_key = (engine_idx, result)
+                if counter_key not in self.counter_tiering_lookup_result_blocks:
+                    self.counter_tiering_lookup_result_blocks[counter_key] = (
+                        self._counter_tiering_lookup_result_blocks.labels(
+                            *(self.per_engine_labelvalues[engine_idx] + [result])
+                        )
                     )
-                )
-            self.counter_tiering_lookup_result_blocks[counter_key].inc(value)
+                self.counter_tiering_lookup_result_blocks[counter_key].inc(value)
+            elif name.endswith("_wall_seconds"):
+                tier = name.removesuffix("_wall_seconds")
+                counter_key = (engine_idx, tier)
+                if counter_key not in self.counter_tiering_lookup_wall_seconds:
+                    self.counter_tiering_lookup_wall_seconds[counter_key] = (
+                        self._counter_tiering_lookup_wall_seconds.labels(
+                            *(self.per_engine_labelvalues[engine_idx] + [tier])
+                        )
+                    )
+                self.counter_tiering_lookup_wall_seconds[counter_key].inc(value)
+            elif name.endswith("_cpu_seconds"):
+                tier = name.removesuffix("_cpu_seconds")
+                counter_key = (engine_idx, tier)
+                if counter_key not in self.counter_tiering_lookup_cpu_seconds:
+                    self.counter_tiering_lookup_cpu_seconds[counter_key] = (
+                        self._counter_tiering_lookup_cpu_seconds.labels(
+                            *(self.per_engine_labelvalues[engine_idx] + [tier])
+                        )
+                    )
+                self.counter_tiering_lookup_cpu_seconds[counter_key].inc(value)
 
     def _observe_primary_eviction_stats(
         self, stats: dict[str, Any], engine_idx: int

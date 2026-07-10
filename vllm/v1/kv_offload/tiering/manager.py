@@ -181,6 +181,9 @@ class TieringOffloadingManager(OffloadingManager):
             str, defaultdict[str, defaultdict[str, float]]
         ] = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
         self._tiering_lookup_stats: defaultdict[str, int] = defaultdict(int)
+        self._tiering_lookup_runtime_stats: defaultdict[str, float] = (
+            defaultdict(float)
+        )
         self._primary_eviction_stats: defaultdict[str, defaultdict[str, int]] = (
             defaultdict(lambda: defaultdict(int))
         )
@@ -274,12 +277,26 @@ class TieringOffloadingManager(OffloadingManager):
     def _record_tiering_lookup_result(self, result: str) -> None:
         self._tiering_lookup_stats[f"{result}_blocks"] += 1
 
-    def take_tiering_lookup_stats(self) -> dict[str, int]:
+    def _record_tiering_lookup_runtime(
+        self,
+        tier: str,
+        *,
+        wall_s: float,
+        cpu_s: float,
+    ) -> None:
+        self._tiering_lookup_runtime_stats[f"{tier}_wall_seconds"] += max(
+            wall_s, 0.0
+        )
+        self._tiering_lookup_runtime_stats[f"{tier}_cpu_seconds"] += max(cpu_s, 0.0)
+
+    def take_tiering_lookup_stats(self) -> dict[str, int | float]:
         """Return tiering lookup counters accumulated since the last call."""
-        if not self._tiering_lookup_stats:
+        if not self._tiering_lookup_stats and not self._tiering_lookup_runtime_stats:
             return {}
-        stats = dict(self._tiering_lookup_stats)
+        stats: dict[str, int | float] = dict(self._tiering_lookup_stats)
+        stats.update(self._tiering_lookup_runtime_stats)
         self._tiering_lookup_stats.clear()
+        self._tiering_lookup_runtime_stats.clear()
         return stats
 
     def _record_primary_eviction(self, cause: str, block_count: int) -> None:
@@ -401,37 +418,66 @@ class TieringOffloadingManager(OffloadingManager):
                     and cannot accept a promotion.
         """
         self._record_tiering_lookup_total()
-        self._maybe_process_finished_jobs()
+        total_wall_start = time.perf_counter()
+        total_cpu_start = time.thread_time()
+        try:
+            self._maybe_process_finished_jobs()
 
-        primary_hit = self.primary_tier.lookup(key, req_context)
-        self._record_tiering_lookup_result("cpu_lookup")
-        if primary_hit is True:
-            self._record_tiering_lookup_result("cpu_hit_ready")
-            return True
-        if primary_hit is None:
-            self._record_tiering_lookup_result("cpu_hit_pending")
-            return None
+            primary_wall_start = time.perf_counter()
+            primary_cpu_start = time.thread_time()
+            try:
+                primary_hit = self.primary_tier.lookup(key, req_context)
+            finally:
+                self._record_tiering_lookup_runtime(
+                    "primary",
+                    wall_s=time.perf_counter() - primary_wall_start,
+                    cpu_s=time.thread_time() - primary_cpu_start,
+                )
 
-        any_none = False
-        for tier in self.secondary_tiers:
-            result = tier.lookup(key, req_context)
-            self._record_tiering_lookup_result("secondary_lookup")
-            if result is True:
-                if not self._initiate_promotion(tier, key, req_context):
-                    self._record_tiering_lookup_result(
-                        "secondary_hit_but_no_primary_slot"
+            self._record_tiering_lookup_result("cpu_lookup")
+            if primary_hit is True:
+                self._record_tiering_lookup_result("cpu_hit_ready")
+                return True
+            if primary_hit is None:
+                self._record_tiering_lookup_result("cpu_hit_pending")
+                return None
+
+            any_none = False
+            for tier in self.secondary_tiers:
+                secondary_wall_start = time.perf_counter()
+                secondary_cpu_start = time.thread_time()
+                try:
+                    result = tier.lookup(key, req_context)
+                finally:
+                    self._record_tiering_lookup_runtime(
+                        "secondary",
+                        wall_s=time.perf_counter() - secondary_wall_start,
+                        cpu_s=time.thread_time() - secondary_cpu_start,
                     )
-                    return False  # primary full, block unavailable
-                self._record_tiering_lookup_result("secondary_hit_ready")
-                return None  # promotion started, retry later
-            if result is None:
-                self._record_tiering_lookup_result("secondary_hit_pending")
-                any_none = True
 
-        if any_none:
-            return None
-        self._record_tiering_lookup_result("miss")
-        return False
+                self._record_tiering_lookup_result("secondary_lookup")
+                if result is True:
+                    if not self._initiate_promotion(tier, key, req_context):
+                        self._record_tiering_lookup_result(
+                            "secondary_hit_but_no_primary_slot"
+                        )
+                        return False  # primary full, block unavailable
+                    self._record_tiering_lookup_result("secondary_hit_ready")
+                    return None  # promotion started, retry later
+                if result is None:
+                    self._record_tiering_lookup_result("secondary_hit_pending")
+                    any_none = True
+
+            if any_none:
+                return None
+            self._record_tiering_lookup_result("miss")
+            return False
+        finally:
+            self._record_tiering_lookup_runtime(
+                "total",
+                wall_s=time.perf_counter() - total_wall_start,
+                cpu_s=time.thread_time() - total_cpu_start,
+            )
 
     def _initiate_promotion(
         self,
