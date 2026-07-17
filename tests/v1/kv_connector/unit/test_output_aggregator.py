@@ -85,6 +85,19 @@ def test_aggregate_workers_output():
     assert aggregated.invalid_block_ids == {3, 4, 5}
 
 
+def test_aggregate_workers_uses_longest_model_forward():
+    aggregator = KVOutputAggregator(expected_finished_count=2)
+    output1 = DummyModelRunnerOutput()
+    output2 = DummyModelRunnerOutput()
+    output1.model_forward_time_s = 0.25
+    output2.model_forward_time_s = 0.5
+
+    aggregated = aggregator.aggregate([output1, output2])
+
+    assert aggregated is output1
+    assert aggregated.model_forward_time_s == 0.5
+
+
 def test_aggregate_workers_output_with_expected_finished_count():
     # We create the aggregator expecting to collect from 4 workers
     aggregator = KVOutputAggregator(expected_finished_count=4)

@@ -246,6 +246,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
+        model_forward_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -259,6 +260,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
         self._routed_experts = routed_experts
+        self._model_forward_events = model_forward_events
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
@@ -306,6 +308,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             )
 
         output = self._model_runner_output
+        if self._model_forward_events is not None:
+            start_event, end_event = self._model_forward_events
+            output.model_forward_time_s = start_event.elapsed_time(end_event) / 1000
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
 
@@ -413,6 +418,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    model_forward_events: tuple[torch.cuda.Event, torch.cuda.Event] | None
 
 
 class GPUModelRunner(
@@ -424,6 +430,21 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        self.critical_path_trace_enabled = (
+            envs.VLLM_CRITICAL_PATH_TRACE_PATH is not None
+        )
+        self._critical_path_forward_event_pairs = (
+            [
+                (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                for _ in range(vllm_config.max_concurrent_batches)
+            ]
+            if self.critical_path_trace_enabled
+            else []
+        )
+        self._critical_path_forward_event_index = 0
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -4260,6 +4281,14 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        model_forward_events = None
+        if self.critical_path_trace_enabled:
+            model_forward_events = self._critical_path_forward_event_pairs[
+                self._critical_path_forward_event_index
+            ]
+            self._critical_path_forward_event_index = (
+                self._critical_path_forward_event_index + 1
+            ) % len(self._critical_path_forward_event_pairs)
         with (
             set_forward_context(
                 attn_metadata,
@@ -4278,6 +4307,8 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if model_forward_events is not None:
+                model_forward_events[0].record()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4285,6 +4316,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if model_forward_events is not None:
+                model_forward_events[1].record()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4355,6 +4388,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            model_forward_events,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4406,6 +4440,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            model_forward_events,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4580,6 +4615,13 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                model_forward_time_s=(
+                    model_forward_events[0].elapsed_time(model_forward_events[1])
+                    / 1000
+                    if model_forward_events is not None
+                    and not self.use_async_scheduling
+                    else 0.0
+                ),
                 routed_experts=None,
             )
 
@@ -4629,6 +4671,7 @@ class GPUModelRunner(
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
+                model_forward_events=model_forward_events,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

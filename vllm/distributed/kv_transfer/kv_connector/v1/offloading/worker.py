@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections import defaultdict
 from dataclasses import replace
 
@@ -236,7 +237,11 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
+            wait_start = time.monotonic()
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
+            self._connector_worker_meta.record_prefix_offload_wait(
+                time.monotonic() - wait_start
+            )
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
@@ -291,7 +296,10 @@ class OffloadingConnectorWorker:
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
-        if not self._connector_worker_meta.completed_jobs:
+        if (
+            not self._connector_worker_meta.completed_jobs
+            and self._connector_worker_meta.prefix_offload_wait_s == 0.0
+        ):
             return None
         meta = self._connector_worker_meta
         self._connector_worker_meta = OffloadingWorkerMetadata()

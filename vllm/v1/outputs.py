@@ -269,6 +269,10 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # GPU time spent in this batch's main model forward. The executor
+    # aggregates this as the maximum across participating workers.
+    model_forward_time_s: float = 0.0
+
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
     #                         num_experts_per_tok); expert IDs as uint8/uint16.

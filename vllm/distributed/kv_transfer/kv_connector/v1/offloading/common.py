@@ -38,15 +38,22 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
 
     Each worker reports {job_id: 1} for newly completed transfer jobs
     (load or store). aggregate() sums counts across workers within a step.
+    Forced store-flush waits use the longest worker wait because the batch
+    cannot proceed until every worker is ready.
     The scheduler accumulates across steps and processes
     a transfer completion only when count reaches num_workers.
     """
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
+    prefix_offload_wait_s: float = 0.0
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
         self.completed_jobs[job_id] = 1
+
+    def record_prefix_offload_wait(self, duration_s: float) -> None:
+        """Record a forced store-flush wait on this model step."""
+        self.prefix_offload_wait_s += max(0.0, duration_s)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -57,4 +64,9 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
 
-        return OffloadingWorkerMetadata(completed_jobs=merged)
+        return OffloadingWorkerMetadata(
+            completed_jobs=merged,
+            prefix_offload_wait_s=max(
+                self.prefix_offload_wait_s, other.prefix_offload_wait_s
+            ),
+        )

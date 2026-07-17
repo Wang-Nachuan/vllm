@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -51,6 +52,11 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics.critical_path import (
+    CriticalPathMetrics,
+    ModelForwardPhase,
+    write_critical_path_record,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -75,6 +81,7 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self.critical_path_trace_path = envs.VLLM_CRITICAL_PATH_TRACE_PATH
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -608,9 +615,17 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
+                    critical_path = request.critical_path_metrics
+                    local_lookup_start = (
+                        time.monotonic() if critical_path is not None else 0.0
+                    )
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    if critical_path is not None:
+                        critical_path.add_prefix_lookup(
+                            time.monotonic() - local_lookup_start
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -805,6 +820,10 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    if request.critical_path_metrics is not None:
+                        request.critical_path_metrics.start_prefix_load(
+                            time.monotonic()
+                        )
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -1340,6 +1359,44 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        model_forward_time_s = model_runner_output.model_forward_time_s
+        if model_forward_time_s > 0.0 and num_scheduled_tokens:
+            new_req_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
+            for req_id in num_scheduled_tokens:
+                # A request has one phase even when the scheduler batch contains
+                # both phases. Charge its full batch-forward critical delay to
+                # that request's own phase.
+                is_prefill = (
+                    req_id in new_req_ids
+                    or scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
+                )
+                phase: ModelForwardPhase = "prefill" if is_prefill else "decode"
+                request = self.requests.get(req_id)
+                if request is not None and request.critical_path_metrics is not None:
+                    request.critical_path_metrics.add_model_forward(
+                        phase, model_forward_time_s
+                    )
+
+        if kv_connector_output is not None:
+            connector_meta = kv_connector_output.kv_connector_worker_meta
+            prefix_offload_wait_s = getattr(
+                connector_meta, "prefix_offload_wait_s", 0.0
+            )
+            if prefix_offload_wait_s > 0.0:
+                held_req_ids = set(num_scheduled_tokens)
+                connector_scheduler_meta = scheduler_output.kv_connector_metadata
+                load_jobs = getattr(connector_scheduler_meta, "load_jobs", {})
+                held_req_ids.update(job.req_id for job in load_jobs.values())
+                for req_id in held_req_ids:
+                    request = self.requests.get(req_id)
+                    if (
+                        request is not None
+                        and request.critical_path_metrics is not None
+                    ):
+                        request.critical_path_metrics.add_prefix_offload(
+                            prefix_offload_wait_s
+                        )
+
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
@@ -1818,6 +1875,8 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            if self.critical_path_trace_path is not None:
+                request.critical_path_metrics = CriticalPathMetrics()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
@@ -1893,6 +1952,11 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        completion_monotonic = time.monotonic()
+        critical_path = request.critical_path_metrics
+        if critical_path is not None:
+            critical_path.finish_pending_waits(completion_monotonic)
+
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
@@ -1904,6 +1968,15 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+
+        if critical_path is not None:
+            assert self.critical_path_trace_path is not None
+            write_critical_path_record(
+                trace_path=self.critical_path_trace_path,
+                request_id=request.external_req_id,
+                server_e2e_s=time.time() - request.arrival_time,
+                metrics=critical_path,
+            )
 
         return kv_xfer_params
 
@@ -2198,6 +2271,8 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            if request.critical_path_metrics is not None:
+                request.critical_path_metrics.finish_prefix_load(time.monotonic())
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED

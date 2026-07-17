@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -189,6 +190,7 @@ class RequestOffloadState:
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
+    lookup_blocker: Literal["load", "offload"] | None = None
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -324,16 +326,17 @@ class OffloadingConnectorScheduler:
                 del self._block_id_to_pending_jobs[bid]
 
     def _maximal_prefix_lookup(
-        self, keys: Iterable[OffloadKey], req_context: ReqContext
+        self, keys: Iterable[OffloadKey], req_status: RequestOffloadState
     ) -> int | None:
         """Return the number of consecutive offloaded blocks from the start,
         or None if the backend deferred a lookup."""
         hit_count = 0
         defer_lookup = False
         for key in keys:
-            result = self.manager.lookup(key, req_context)
+            result = self.manager.lookup(key, req_status.req_context)
             if result is None:
                 defer_lookup = True
+                req_status.lookup_blocker = "offload"
                 # continue lookup to allow manager to kick-off async lookups
                 # for all blocks (until a miss is detected)
                 result = True
@@ -346,7 +349,7 @@ class OffloadingConnectorScheduler:
         self,
         keys: Sequence[OffloadKey],
         sliding_window_size: int,
-        req_context: ReqContext,
+        req_status: RequestOffloadState,
     ) -> int | None:
         """Return the end index (in `keys`) of the last run of
         `sliding_window_size` consecutive hits, scanning from the end.
@@ -354,9 +357,10 @@ class OffloadingConnectorScheduler:
         defer_lookup = False
         consecutive_hits = 0
         for idx in range(len(keys) - 1, -1, -1):
-            result = self.manager.lookup(keys[idx], req_context)
+            result = self.manager.lookup(keys[idx], req_status.req_context)
             if result is None:
                 defer_lookup = True
+                req_status.lookup_blocker = "offload"
                 # continue lookup to allow manager to kick-off async lookups
                 # for all blocks (until a hit is detected)
                 result = False
@@ -396,6 +400,7 @@ class OffloadingConnectorScheduler:
         can invalidate an earlier group's result, so the loop re-runs when that
         happens until num_hit_tokens converges.
         """
+        req_status.lookup_blocker = None
         num_computed_tokens = req_status.num_locally_computed_tokens
         max_hit_size_tokens: int = req_status.req.num_tokens
         if self._sliding_window_groups:
@@ -445,13 +450,13 @@ class OffloadingConnectorScheduler:
                 num_hit_blocks: int | None
                 if sliding_window_size_in_blocks is None:
                     num_hit_blocks = self._maximal_prefix_lookup(
-                        offload_keys, req_status.req_context
+                        offload_keys, req_status
                     )
                 else:
                     num_hit_blocks = self._sliding_window_lookup(
                         offload_keys,
                         sliding_window_size_in_blocks,
-                        req_status.req_context,
+                        req_status,
                     )
                 if num_hit_blocks == 0:
                     return 0
@@ -509,6 +514,7 @@ class OffloadingConnectorScheduler:
                     offload_keys = offload_keys[-sliding_window_size_in_blocks:]
                 if any(key in self._blocks_being_loaded for key in offload_keys):
                     # hit blocks are being loaded, delay request
+                    req_status.lookup_blocker = "load"
                     logger.debug(
                         "Delaying request %s since some of its"
                         " blocks are already being loaded",
@@ -566,10 +572,21 @@ class OffloadingConnectorScheduler:
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
 
+        critical_path = request.critical_path_metrics
+        lookup_start = time.monotonic() if critical_path is not None else 0.0
+        if critical_path is not None:
+            critical_path.finish_lookup_wait(lookup_start)
         num_hit_tokens = self._lookup(req_status)
+        if critical_path is not None:
+            critical_path.add_prefix_lookup(time.monotonic() - lookup_start)
         req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
+        if num_hit_tokens is None and critical_path is not None:
+            assert req_status.lookup_blocker is not None
+            critical_path.start_lookup_wait(
+                req_status.lookup_blocker, time.monotonic()
+            )
 
         return num_hit_tokens, bool(num_hit_tokens)
 

@@ -157,6 +157,11 @@ class KVOutputAggregator:
         output = outputs[output_rank]
 
         assert output is not None
+        output.model_forward_time_s = max(
+            getattr(model_runner_output, "model_forward_time_s", 0.0)
+            for model_runner_output in outputs
+            if model_runner_output is not None
+        )
         output.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending or None,
             finished_recving=finished_recving or None,

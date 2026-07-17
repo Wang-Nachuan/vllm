@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -32,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
+from vllm.v1.metrics.critical_path import CriticalPathMetrics
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
@@ -104,6 +106,75 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
     assert len(scheduler.running) == len(requests)
     for i, request in enumerate(requests):
         assert scheduler.running[i] == request
+
+
+def test_model_forward_time_uses_each_request_phase_in_mixed_batch(tmp_path):
+    model_dir = tmp_path / "opt"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["OPTForCausalLM"],
+                "model_type": "opt",
+                "hidden_size": 64,
+                "ffn_dim": 256,
+                "num_attention_heads": 8,
+                "num_hidden_layers": 2,
+                "vocab_size": 1024,
+                "max_position_embeddings": 2048,
+                "word_embed_proj_dim": 64,
+                "do_layer_norm_before": True,
+            }
+        )
+    )
+    scheduler = create_scheduler(
+        model=str(model_dir), max_num_seqs=2, skip_tokenizer_init=True
+    )
+    decode_req, prefill_req = create_requests(
+        num_requests=2, num_tokens=8, req_ids=["decode", "prefill"]
+    )
+    decode_req.critical_path_metrics = CriticalPathMetrics()
+    prefill_req.critical_path_metrics = CriticalPathMetrics()
+
+    scheduler.add_request(decode_req)
+    first_output = scheduler.schedule()
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=[decode_req.request_id],
+            req_id_to_index={decode_req.request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            model_forward_time_s=0.1,
+        ),
+    )
+
+    scheduler.add_request(prefill_req)
+    mixed_output = scheduler.schedule()
+    assert decode_req.request_id in mixed_output.scheduled_cached_reqs.req_ids
+    assert prefill_req.request_id in {
+        request.req_id for request in mixed_output.scheduled_new_reqs
+    }
+    req_ids = list(mixed_output.num_scheduled_tokens)
+    scheduler.update_from_output(
+        mixed_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+            sampled_token_ids=[[0] for _req_id in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            model_forward_time_s=0.5,
+        ),
+    )
+
+    assert decode_req.critical_path_metrics.prefill_s == pytest.approx(0.1)
+    assert decode_req.critical_path_metrics.decode_s == pytest.approx(0.5)
+    assert prefill_req.critical_path_metrics.prefill_s == pytest.approx(0.5)
+    assert prefill_req.critical_path_metrics.decode_s == 0.0
 
 
 def test_schedule_multimodal_requests():

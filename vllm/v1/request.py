@@ -20,6 +20,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.metrics.critical_path import CriticalPathMetrics
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
@@ -77,8 +78,12 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        external_req_id: str | None = None,
     ) -> None:
         self.request_id = request_id
+        self.external_req_id = (
+            external_req_id if external_req_id is not None else request_id
+        )
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -171,6 +176,7 @@ class Request:
         self.num_preemptions = 0
 
         self.prefill_stats: PrefillStats | None = PrefillStats()
+        self.critical_path_metrics: CriticalPathMetrics | None = None
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
@@ -215,6 +221,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            external_req_id=request.external_req_id,
         )
 
     def append_output_token_ids(
