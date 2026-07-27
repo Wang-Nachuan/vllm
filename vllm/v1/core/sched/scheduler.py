@@ -773,6 +773,12 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                prefix_load_started_at = (
+                    time.monotonic()
+                    if load_kv_async and request.critical_path_metrics is not None
+                    else None
+                )
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -794,6 +800,11 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                if prefix_load_started_at is not None:
+                    request.critical_path_metrics.start_prefix_load(
+                        prefix_load_started_at
+                    )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -820,10 +831,6 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-                    if request.critical_path_metrics is not None:
-                        request.critical_path_metrics.start_prefix_load(
-                            time.monotonic()
-                        )
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -1382,6 +1389,9 @@ class Scheduler(SchedulerInterface):
             prefix_offload_wait_s = getattr(
                 connector_meta, "prefix_offload_wait_s", 0.0
             )
+            prefix_offload_wait_started_at_s = getattr(
+                connector_meta, "prefix_offload_wait_started_at_s", None
+            )
             if prefix_offload_wait_s > 0.0:
                 held_req_ids = set(num_scheduled_tokens)
                 connector_scheduler_meta = scheduler_output.kv_connector_metadata
@@ -1394,7 +1404,8 @@ class Scheduler(SchedulerInterface):
                         and request.critical_path_metrics is not None
                     ):
                         request.critical_path_metrics.add_prefix_offload(
-                            prefix_offload_wait_s
+                            prefix_offload_wait_s,
+                            prefix_offload_wait_started_at_s,
                         )
 
         perf_stats: PerfStats | None = None

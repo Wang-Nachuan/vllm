@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    LoadJobTiming,
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
     ReqId,
@@ -46,8 +47,8 @@ class OffloadingConnectorWorker:
         self.worker = OffloadingWorker()
 
         self.kv_connector_stats = OffloadingConnectorStats()
-        # job_id -> req_id for in-flight loads.
-        self._load_jobs: dict[int, ReqId] = {}
+        # job_id -> (req_id, worker start, transfer enqueue) for in-flight loads.
+        self._load_jobs: dict[int, tuple[ReqId, float, float]] = {}
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
@@ -240,7 +241,7 @@ class OffloadingConnectorWorker:
             wait_start = time.monotonic()
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
             self._connector_worker_meta.record_prefix_offload_wait(
-                time.monotonic() - wait_start
+                wait_start, time.monotonic() - wait_start
             )
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
@@ -250,8 +251,14 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
-            self._load_jobs[job_id] = entry.req_id
+            worker_start_s = time.monotonic()
             success = self.worker.transfer_async(job_id, entry.transfer_spec)
+            worker_enqueue_s = time.monotonic()
+            self._load_jobs[job_id] = (
+                entry.req_id,
+                worker_start_s,
+                worker_enqueue_s,
+            )
             assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
@@ -273,6 +280,7 @@ class OffloadingConnectorWorker:
         """
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
+            completion_observed_s = time.monotonic()
             # we currently do not support job failures
             job_id = transfer_result.job_id
             assert transfer_result.success
@@ -288,8 +296,19 @@ class OffloadingConnectorWorker:
                 )
 
             self._connector_worker_meta.mark_completed(job_id)
-            req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
+            load_job = self._load_jobs.pop(job_id, None)
+            if load_job is not None:
+                req_id, worker_start_s, worker_enqueue_s = load_job
+                self._connector_worker_meta.record_load_job_timing(
+                    job_id,
+                    LoadJobTiming(
+                        worker_start_s=worker_start_s,
+                        worker_enqueue_s=worker_enqueue_s,
+                        dma_elapsed_s=max(0.0, transfer_result.transfer_time or 0.0),
+                        completion_observed_s=completion_observed_s,
+                        transfer_bytes=max(0, transfer_result.transfer_size or 0),
+                    ),
+                )
                 finished_recving.add(req_id)
 
         return set(), finished_recving
@@ -298,6 +317,7 @@ class OffloadingConnectorWorker:
         """Return completed transfer job IDs since the last call."""
         if (
             not self._connector_worker_meta.completed_jobs
+            and not self._connector_worker_meta.load_job_timings
             and self._connector_worker_meta.prefix_offload_wait_s == 0.0
         ):
             return None

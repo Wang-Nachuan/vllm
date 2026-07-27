@@ -22,6 +22,7 @@ from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
+from vllm.v1.kv_offload.tiering.fs.thread_pool import JobState
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -149,6 +150,22 @@ def test_lookup_empty_tier(fs_tier):
     assert tier.lookup(key(2), _CTX) is False
 
 
+def test_job_state_reports_critical_task_instead_of_summing_tasks():
+    state = JobState(job_id=7, n_tasks=2, submitted_at=1.0)
+
+    # The task with the later finish can report first if the other thread is
+    # delayed before acquiring JobState's lock.
+    assert state.task_done(True, started_at=3.0, finished_at=8.0) is None
+    result = state.task_done(False, started_at=4.0, finished_at=7.0)
+
+    assert result is not None
+    assert not result.success
+    assert result.timing is not None
+    assert result.timing.submitted_at == 1.0
+    assert result.timing.last_task_started_at == 3.0
+    assert result.timing.last_task_finished_at == 8.0
+
+
 def test_store_creates_file_and_lookup_succeeds(fs_tier):
     tier, _ = fs_tier
     job = make_job(1, [key(1)], [0])
@@ -175,6 +192,14 @@ def test_store_then_load_roundtrip(fs_tier):
     tier.submit_load(job_l)
     load_results = drain(tier)
     assert all(r.success for r in load_results)
+    assert len(load_results) == 1
+    timing = load_results[0].timing
+    assert timing is not None
+    assert (
+        timing.submitted_at
+        <= timing.last_task_started_at
+        <= timing.last_task_finished_at
+    )
     # Blocks stay on disk after load
     assert tier.lookup(key(1), _CTX) is True
     assert tier.lookup(key(2), _CTX) is True
@@ -281,3 +306,27 @@ def test_store_load_data_integrity(fs_tier):
         assert torch.allclose(tensor[bid], expected[i]), (
             f"Block {bid} data mismatch after store+load"
         )
+
+
+def test_buffered_io_roundtrip(tmp_path):
+    tensor = _page_aligned_rand_tensor(2, _BLOCK_ELEMENTS)
+    expected = tensor[0].clone()
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        direct_io=False,
+    )
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(result.success for result in drain(tier))
+
+        tensor[1] = 0.0
+        tier.submit_load(make_job(2, [key(1)], [1], is_promotion=True))
+        assert all(result.success for result in drain(tier))
+        assert torch.equal(tensor[1], expected)
+    finally:
+        tier.shutdown()

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -24,6 +24,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     OffloadingSpec,
 )
+from vllm.v1.kv_offload.worker.worker import TransferResult
 
 NUM_BLOCKS = 10
 BLOCK_SIZE = 16
@@ -104,6 +105,70 @@ def _make_worker(kv_cache_config: KVCacheConfig):
     worker.worker = MagicMock()
 
     return worker, spec
+
+
+def test_load_job_timing_metadata():
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingConnectorMetadata,
+        TransferJob,
+    )
+
+    worker, _ = _make_worker(MagicMock(spec=KVCacheConfig))
+    worker.worker.transfer_async.return_value = True
+    transfer_spec = MagicMock()
+    metadata = OffloadingConnectorMetadata(
+        load_jobs={5: TransferJob(req_id="req-5", transfer_spec=transfer_spec)},
+        store_jobs={},
+    )
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker.time.monotonic",
+        side_effect=[10.0, 10.25, 10.8],
+    ):
+        worker.start_kv_transfers(metadata)
+        worker.worker.get_finished.return_value = [
+            TransferResult(
+                job_id=5,
+                success=True,
+                transfer_size=4096,
+                transfer_time=0.4,
+                transfer_type=("CPU", "GPU"),
+            )
+        ]
+        _, finished_recving = worker.get_finished(set())
+
+    assert finished_recving == {"req-5"}
+    meta = worker.build_connector_worker_meta()
+    assert meta is not None
+    assert meta.completed_jobs == {5: 1}
+    timing = meta.load_job_timings[5]
+    assert timing.worker_start_s == 10.0
+    assert timing.worker_enqueue_s == 10.25
+    assert timing.dma_elapsed_s == 0.4
+    assert timing.completion_observed_s == 10.8
+    assert timing.transfer_bytes == 4096
+
+
+def test_store_completion_does_not_emit_load_timing():
+    worker, _ = _make_worker(MagicMock(spec=KVCacheConfig))
+    worker.worker.get_finished.return_value = [
+        TransferResult(
+            job_id=9,
+            success=True,
+            transfer_size=2048,
+            transfer_time=0.2,
+            transfer_type=("GPU", "CPU"),
+        )
+    ]
+
+    finished_sending, finished_recving = worker.get_finished(set())
+
+    assert not finished_sending
+    assert not finished_recving
+    meta = worker.build_connector_worker_meta()
+    assert meta is not None
+    assert meta.completed_jobs == {9: 1}
+    assert not meta.load_job_timings
 
 
 # ---------------------------------------------------------------------------

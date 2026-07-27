@@ -20,9 +20,11 @@ Key Design Principles:
    protecting blocks from eviction until complete_read() is called
 """
 
+import time
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 from typing_extensions import override
@@ -49,12 +51,28 @@ from vllm.v1.kv_offload.tiering.base import (
 
 logger = init_logger(__name__)
 
+L2PromotionWaitSource = Literal["owned", "shared"]
+
+
+@dataclass(frozen=True, slots=True)
+class L2PromotionTiming:
+    """Critical-branch host timings for one secondary-to-primary promotion."""
+
+    tier_type: str
+    success: bool
+    initiated_at: float
+    submitted_at: float | None
+    last_task_started_at: float | None
+    last_task_finished_at: float | None
+    observed_at: float
+
 
 @dataclass
 class PendingPromotion:
     """Accumulator for blocks awaiting submit_load() for one (tier, request)."""
 
     req_context: ReqContext
+    initiated_at: float
     keys: list[OffloadKey] = field(default_factory=list)
     block_ids: list[int] = field(default_factory=list)
 
@@ -151,6 +169,19 @@ class TieringOffloadingManager(OffloadingManager):
         #   False: primary → secondary (cascade)
         self._transfer_jobs: dict[JobId, JobMetadata] = {}
 
+        # Promotion ownership distinguishes a request's own L2 promotion from
+        # a shared wait on another request's promotion. Completed timing is
+        # consumable only by the owner and retained only for its lifetime.
+        self._promotion_owners: dict[OffloadKey, str] = {}
+        self._promotion_started_at: dict[JobId, float] = {}
+        self._completed_l2_promotion_timings: defaultdict[
+            str, list[L2PromotionTiming]
+        ] = defaultdict(list)
+        self._synchronous_l2_admission_s: defaultdict[str, float] = defaultdict(
+            float
+        )
+        self._finished_promotion_owners: set[str] = set()
+
         # Pending promotion requests accumulated during lookup() calls; flushed
         # as one batched submit_load() per (tier, request) in on_schedule_end().
         # Outer key: tier. Inner key: req_context.req_id — the same ReqContext
@@ -202,6 +233,7 @@ class TieringOffloadingManager(OffloadingManager):
         """
         for i, tier in enumerate(self.secondary_tiers):
             for completed_job in tier.get_finished_jobs():
+                observed_at = time.monotonic()
                 job_id = completed_job.job_id
                 job_metadata = self._transfer_jobs.pop(job_id, None)
                 assert job_metadata is not None, (
@@ -217,6 +249,38 @@ class TieringOffloadingManager(OffloadingManager):
                         job_metadata.req_context,
                         completed_job.success,
                     )
+                    initiated_at = self._promotion_started_at.pop(job_id)
+                    job_timing = completed_job.timing
+                    owner = job_metadata.req_context.req_id
+                    if owner not in self._finished_promotion_owners:
+                        self._completed_l2_promotion_timings[owner].append(
+                            L2PromotionTiming(
+                                tier_type=tier.tier_type,
+                                success=completed_job.success,
+                                initiated_at=initiated_at,
+                                submitted_at=(
+                                    job_timing.submitted_at
+                                    if job_timing is not None
+                                    else None
+                                ),
+                                last_task_started_at=(
+                                    job_timing.last_task_started_at
+                                    if job_timing is not None
+                                    else None
+                                ),
+                                last_task_finished_at=(
+                                    job_timing.last_task_finished_at
+                                    if job_timing is not None
+                                    else None
+                                ),
+                                observed_at=observed_at,
+                            )
+                        )
+                    for key in job_metadata.keys:
+                        if self._promotion_owners.get(key) == owner:
+                            del self._promotion_owners[key]
+                    if owner not in self._promotion_owners.values():
+                        self._finished_promotion_owners.discard(owner)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
@@ -268,6 +332,29 @@ class TieringOffloadingManager(OffloadingManager):
             return None
         return False
 
+    def get_l2_promotion_wait_source(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> L2PromotionWaitSource | None:
+        """Classify a deferred lookup caused by an in-flight L2 promotion.
+
+        Call immediately after ``lookup()`` returns ``None``. ``None`` means
+        that the deferral has another source, such as a primary-tier store.
+        """
+        owner = self._promotion_owners.get(key)
+        if owner is None:
+            return None
+        return "owned" if owner == req_context.req_id else "shared"
+
+    def take_completed_l2_promotion_timings(
+        self, req_context: ReqContext
+    ) -> list[L2PromotionTiming]:
+        """Return an owning request's completed promotion timings once."""
+        return self._completed_l2_promotion_timings.pop(req_context.req_id, [])
+
+    def take_synchronous_l2_admission_s(self, req_context: ReqContext) -> float:
+        """Return in-lookup L2-to-L1 admission work for this request once."""
+        return self._synchronous_l2_admission_s.pop(req_context.req_id, 0.0)
+
     def _initiate_promotion(
         self,
         tier: SecondaryTierManager,
@@ -291,6 +378,8 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             True if promotion was initiated, False if primary tier is full.
         """
+        initiated_at = time.monotonic()
+
         # Allocate space in primary tier for promoted block.
         # Must happen immediately so primary.lookup() returns None (in-flight)
         # for this key on any subsequent lookup() call within the same step,
@@ -310,11 +399,17 @@ class TieringOffloadingManager(OffloadingManager):
         ctx_id = req_context.req_id
         if ctx_id not in tier_pending:
             tier_pending[ctx_id] = PendingPromotion(
-                keys=[], block_ids=[], req_context=req_context
+                req_context=req_context,
+                initiated_at=initiated_at,
             )
         entry = tier_pending[ctx_id]
         entry.keys.extend(primary_write_result.keys_to_store)
         entry.block_ids.extend(store_spec.block_ids)
+        for promoted_key in primary_write_result.keys_to_store:
+            self._promotion_owners[promoted_key] = req_context.req_id
+        self._synchronous_l2_admission_s[req_context.req_id] += max(
+            0.0, time.monotonic() - initiated_at
+        )
         return True
 
     def _flush_pending_promotions(self) -> None:
@@ -337,6 +432,7 @@ class TieringOffloadingManager(OffloadingManager):
                     req_context=entry.req_context,
                 )
                 self._transfer_jobs[job_id] = job_metadata
+                self._promotion_started_at[job_id] = entry.initiated_at
                 tier.submit_load(job_metadata)
 
         self._pending_load_submissions.clear()
@@ -558,10 +654,14 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
+        if req_context.req_id in self._promotion_owners.values():
+            self._finished_promotion_owners.add(req_context.req_id)
         self.primary_tier.on_request_finished(req_context)
         for tier in self.secondary_tiers:
             tier.on_request_finished(req_context)
         self._request_level_tiers.pop(req_context.req_id, None)
+        self._completed_l2_promotion_timings.pop(req_context.req_id, None)
+        self._synchronous_l2_admission_s.pop(req_context.req_id, None)
 
     @override
     def on_schedule_end(self) -> None:

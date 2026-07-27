@@ -44,6 +44,10 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
+LookupBlocker = Literal[
+    "owned_l2", "shared_l1", "shared_l2", "unattributed_load", "offload"
+]
+
 
 @dataclass(slots=True)
 class TransferJobStatus:
@@ -190,7 +194,7 @@ class RequestOffloadState:
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
-    lookup_blocker: Literal["load", "offload"] | None = None
+    lookup_blockers: set[LookupBlocker] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -325,6 +329,19 @@ class OffloadingConnectorScheduler:
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
 
+    def _classify_deferred_lookup(
+        self, key: OffloadKey, req_status: RequestOffloadState
+    ) -> LookupBlocker:
+        classify = getattr(self.manager, "get_l2_promotion_wait_source", None)
+        if classify is None:
+            return "offload"
+        source = classify(key, req_status.req_context)
+        if source == "owned":
+            return "owned_l2"
+        if source == "shared":
+            return "shared_l2"
+        return "offload"
+
     def _maximal_prefix_lookup(
         self, keys: Iterable[OffloadKey], req_status: RequestOffloadState
     ) -> int | None:
@@ -336,7 +353,9 @@ class OffloadingConnectorScheduler:
             result = self.manager.lookup(key, req_status.req_context)
             if result is None:
                 defer_lookup = True
-                req_status.lookup_blocker = "offload"
+                req_status.lookup_blockers.add(
+                    self._classify_deferred_lookup(key, req_status)
+                )
                 # continue lookup to allow manager to kick-off async lookups
                 # for all blocks (until a miss is detected)
                 result = True
@@ -360,7 +379,9 @@ class OffloadingConnectorScheduler:
             result = self.manager.lookup(keys[idx], req_status.req_context)
             if result is None:
                 defer_lookup = True
-                req_status.lookup_blocker = "offload"
+                req_status.lookup_blockers.add(
+                    self._classify_deferred_lookup(keys[idx], req_status)
+                )
                 # continue lookup to allow manager to kick-off async lookups
                 # for all blocks (until a hit is detected)
                 result = False
@@ -400,7 +421,7 @@ class OffloadingConnectorScheduler:
         can invalidate an earlier group's result, so the loop re-runs when that
         happens until num_hit_tokens converges.
         """
-        req_status.lookup_blocker = None
+        req_status.lookup_blockers.clear()
         num_computed_tokens = req_status.num_locally_computed_tokens
         max_hit_size_tokens: int = req_status.req.num_tokens
         if self._sliding_window_groups:
@@ -514,7 +535,7 @@ class OffloadingConnectorScheduler:
                     offload_keys = offload_keys[-sliding_window_size_in_blocks:]
                 if any(key in self._blocks_being_loaded for key in offload_keys):
                     # hit blocks are being loaded, delay request
-                    req_status.lookup_blocker = "load"
+                    req_status.lookup_blockers.add("shared_l1")
                     logger.debug(
                         "Delaying request %s since some of its"
                         " blocks are already being loaded",
@@ -578,14 +599,57 @@ class OffloadingConnectorScheduler:
             critical_path.finish_lookup_wait(lookup_start)
         num_hit_tokens = self._lookup(req_status)
         if critical_path is not None:
-            critical_path.add_prefix_lookup(time.monotonic() - lookup_start)
+            lookup_elapsed_s = time.monotonic() - lookup_start
+            take_synchronous_admission = getattr(
+                self.manager, "take_synchronous_l2_admission_s", None
+            )
+            synchronous_admission_s = (
+                take_synchronous_admission(req_status.req_context)
+                if take_synchronous_admission is not None
+                else 0.0
+            )
+            synchronous_admission_s = min(
+                lookup_elapsed_s, synchronous_admission_s
+            )
+            critical_path.add_prefix_lookup(
+                lookup_elapsed_s - synchronous_admission_s
+            )
+            critical_path.add_synchronous_l2_admission(
+                synchronous_admission_s
+            )
+            take_l2_timings = getattr(
+                self.manager, "take_completed_l2_promotion_timings", None
+            )
+            if take_l2_timings is not None:
+                timings = take_l2_timings(req_status.req_context)
+                if timings:
+                    timing = max(
+                        timings,
+                        key=lambda item: (
+                            item.last_task_finished_at
+                            if item.last_task_finished_at is not None
+                            else item.observed_at,
+                            item.observed_at,
+                        ),
+                    )
+                    critical_path.record_l2_promotion_timing(
+                        initiated_at=timing.initiated_at,
+                        submitted_at=timing.submitted_at,
+                        last_task_started_at=timing.last_task_started_at,
+                        last_task_finished_at=timing.last_task_finished_at,
+                    )
         req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
         if num_hit_tokens is None and critical_path is not None:
-            assert req_status.lookup_blocker is not None
+            assert req_status.lookup_blockers
+            wait_reason = (
+                next(iter(req_status.lookup_blockers))
+                if len(req_status.lookup_blockers) == 1
+                else "unattributed_load"
+            )
             critical_path.start_lookup_wait(
-                req_status.lookup_blocker, time.monotonic()
+                wait_reason, time.monotonic()
             )
 
         return num_hit_tokens, bool(num_hit_tokens)
@@ -982,6 +1046,21 @@ class OffloadingConnectorScheduler:
                 )
                 continue
             job_status = self._jobs[job_id]
+            load_timing = meta.load_job_timings.get(job_id)
+            if (
+                not job_status.is_store
+                and load_timing is not None
+                and (
+                    critical_path := self._req_status[
+                        job_status.req_id
+                    ].req.critical_path_metrics
+                )
+                is not None
+            ):
+                critical_path.record_l1_load_timing(
+                    worker_enqueue_s=load_timing.worker_enqueue_s,
+                    dma_elapsed_s=load_timing.dma_elapsed_s,
+                )
             job_status.pending_count -= count
             if job_status.pending_count > 0:
                 continue

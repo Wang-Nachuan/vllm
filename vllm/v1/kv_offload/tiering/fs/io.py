@@ -34,6 +34,7 @@ def store_block(
     buffer: memoryview,
     offset: int,
     block_size: int,
+    direct_io: bool = True,
 ) -> None:
     """
     Store callback: Writes to a temp file then atomically replaces the destination.
@@ -52,7 +53,11 @@ def store_block(
     try:
         fd = os.open(
             tmp_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TRUNC | O_DIRECT,
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | os.O_TRUNC
+            | (O_DIRECT if direct_io else 0),
             0o644,
         )
         try:
@@ -77,6 +82,7 @@ def load_block(
     view: memoryview,
     offset: int,
     block_size: int,
+    direct_io: bool = True,
 ) -> None:
     """
     Load callback: read one KV block from disk. Remove the file on failure.
@@ -84,7 +90,7 @@ def load_block(
     fd: int | None = None
     view_slice = view.cast("B")[offset : offset + block_size]
     try:
-        fd = os.open(source_path, os.O_RDONLY | O_DIRECT)
+        fd = os.open(source_path, os.O_RDONLY | (O_DIRECT if direct_io else 0))
         bytes_read = os.readv(fd, [view_slice])
         if bytes_read < block_size:
             raise OSError(f"Short read: expected {block_size} bytes, read {bytes_read}")

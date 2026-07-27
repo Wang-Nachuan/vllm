@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -634,7 +635,9 @@ def _make_scheduler_with_lookup(
     return scheduler
 
 
-_EMPTY_REQ_CTX = ReqContext(req_id="")
+_EMPTY_REQ_CTX = SimpleNamespace(
+    req_context=ReqContext(req_id=""), lookup_blockers=set()
+)
 
 
 class TestMaximalPrefixLookup:

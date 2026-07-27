@@ -24,6 +24,7 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     make_offload_key,
 )
+from vllm.v1.kv_offload.tiering.base import JobResult, JobTiming
 from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
@@ -388,11 +389,22 @@ class TestTieringOffloadingManager:
         ctx_b = ReqContext(req_id="req_b")
 
         result_a = self.manager.lookup(shared_block, ctx_a)
+        assert (
+            self.manager.get_l2_promotion_wait_source(shared_block, ctx_a)
+            == "owned"
+        )
         result_b = self.manager.lookup(shared_block, ctx_b)
+        assert (
+            self.manager.get_l2_promotion_wait_source(shared_block, ctx_b)
+            == "shared"
+        )
 
         # Both see None (in-flight), but promotion is only queued once
         assert result_a is None
         assert result_b is None
+        assert self.manager.take_synchronous_l2_admission_s(ctx_a) >= 0.0
+        assert self.manager.take_synchronous_l2_admission_s(ctx_a) == 0.0
+        assert self.manager.take_synchronous_l2_admission_s(ctx_b) == 0.0
 
         self._simulate_on_schedule_end()
 
@@ -401,6 +413,46 @@ class TestTieringOffloadingManager:
         job_metadata = self.secondary_tier1.submit_load.call_args.args[0]
         assert list(job_metadata.keys) == [shared_block]
         assert job_metadata.req_context is ctx_a
+
+        original_result = self.secondary_tier1.completed_jobs[0]
+        initiated_at = self.manager._promotion_started_at[original_result.job_id]
+        job_timing = JobTiming(
+            submitted_at=initiated_at + 1e-9,
+            last_task_started_at=initiated_at + 2e-9,
+            last_task_finished_at=initiated_at + 3e-9,
+        )
+        self.secondary_tier1.completed_jobs[0] = JobResult(
+            job_id=original_result.job_id,
+            success=original_result.success,
+            timing=job_timing,
+        )
+
+        self._simulate_on_schedule_end()
+
+        timings = self.manager.take_completed_l2_promotion_timings(ctx_a)
+        assert len(timings) == 1
+        assert timings[0].tier_type == self.secondary_tier1.tier_type
+        assert timings[0].initiated_at == initiated_at
+        assert timings[0].submitted_at == job_timing.submitted_at
+        assert timings[0].last_task_started_at == job_timing.last_task_started_at
+        assert timings[0].last_task_finished_at == job_timing.last_task_finished_at
+        assert timings[0].observed_at >= timings[0].initiated_at
+        assert self.manager.take_completed_l2_promotion_timings(ctx_a) == []
+        assert self.manager.take_completed_l2_promotion_timings(ctx_b) == []
+
+    def test_finished_request_drops_late_promotion_timing(self, manager_setup):
+        block = to_keys([0])[0]
+        self.secondary_tier1.blocks[block] = True
+        ctx = ReqContext(req_id="finished_owner")
+
+        assert self.manager.lookup(block, ctx) is None
+        self._simulate_on_schedule_end()
+        self.manager.on_request_finished(ctx)
+        self._simulate_on_schedule_end()
+
+        assert self.manager.take_completed_l2_promotion_timings(ctx) == []
+        assert ctx.req_id not in self.manager._finished_promotion_owners
+        assert block not in self.manager._promotion_owners
 
     def test_complete_store_forwards_req_context_to_submit_store(self, manager_setup):
         """complete_store cascades to secondary tiers with the correct req_context."""

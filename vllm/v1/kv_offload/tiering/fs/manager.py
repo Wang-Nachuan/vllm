@@ -70,6 +70,7 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
+        direct_io: bool = True,
     ):
         """
         Args:
@@ -80,6 +81,7 @@ class FileSystemTierManager(SecondaryTierManager):
             root_dir: Root directory for block files.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
+            direct_io: Whether to use O_DIRECT for block files.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -88,6 +90,7 @@ class FileSystemTierManager(SecondaryTierManager):
             "primary_kv_view.strides cannot be None"
         )
         self._block_size: int = primary_kv_view.strides[0]
+        self._direct_io = direct_io
 
         # Create file mapper
         self.file_mapper = FileMapper.from_offloading_spec(
@@ -130,6 +133,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
+                self._direct_io,
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
@@ -144,6 +148,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
+                self._direct_io,
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
@@ -154,10 +159,7 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         Collect completed jobs from the finished-jobs queue.
         """
-        return (
-            JobResult(job_id=job_id, success=success)
-            for job_id, success in self._pool.get_finished()
-        )
+        return self._pool.get_finished()
 
     @override
     def shutdown(self) -> None:

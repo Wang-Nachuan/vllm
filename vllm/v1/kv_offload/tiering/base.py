@@ -31,12 +31,28 @@ class JobMetadata:
     req_context: ReqContext
 
 
+@dataclass(frozen=True, slots=True)
+class JobTiming:
+    """Host-monotonic timing for one asynchronous transfer job.
+
+    A job may contain multiple block tasks that execute concurrently. The
+    task timestamps describe the task that finished last, i.e. the branch
+    that determines the job's I/O completion latency. Parallel task times
+    must not be summed.
+    """
+
+    submitted_at: float
+    last_task_started_at: float
+    last_task_finished_at: float
+
+
 @dataclass
 class JobResult:
     """Result of an async transfer job (successful or failed)."""
 
     job_id: JobId
     success: bool
+    timing: JobTiming | None = None
 
 
 class SecondaryTierManager(ABC):
