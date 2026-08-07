@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, Literal, NamedTuple
@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
+    LoadStoreSpec,
     OffloadingManager,
     OffloadingSpec,
     OffloadKey,
@@ -49,6 +50,11 @@ LookupBlocker = Literal[
 ]
 
 
+class LookupResult(NamedTuple):
+    value: int
+    deferred: bool
+
+
 @dataclass(slots=True)
 class TransferJobStatus:
     """Tracks scheduler-side state for a single transfer job."""
@@ -66,6 +72,14 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+
+
+@dataclass(slots=True)
+class PendingJointL2Load:
+    """GPU destination reserved while its L2 promotion finishes."""
+
+    keys: tuple[OffloadKey, ...]
+    dst_spec: GPULoadStoreSpec
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -103,9 +117,16 @@ class SchedulerOffloadConfig(NamedTuple):
     block_size_factor: int
     num_workers: int
     offload_prompt_only: bool
+    joint_l2_gpu_admission: bool
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
+        joint_l2_gpu_admission = spec.extra_config.get(
+            "joint_l2_gpu_admission", False
+        )
+        if not isinstance(joint_l2_gpu_admission, bool):
+            raise ValueError("joint_l2_gpu_admission must be a boolean")
+
         # Determine the alignment token count from the full-attention group(s).
         # This is the offloaded_block_size of the full-attention group; load
         # hits are always aligned to this boundary, so SWA blocks earlier in
@@ -166,6 +187,7 @@ class SchedulerOffloadConfig(NamedTuple):
             ),
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
+            joint_l2_gpu_admission=joint_l2_gpu_admission,
         )
 
 
@@ -195,6 +217,7 @@ class RequestOffloadState:
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
     lookup_blockers: set[LookupBlocker] = field(default_factory=set)
+    joint_l2_candidate: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -271,6 +294,14 @@ class OffloadingConnectorScheduler:
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
+        if (
+            self.config.joint_l2_gpu_admission
+            and not self.manager.supports_joint_l2_gpu_admission()
+        ):
+            raise ValueError(
+                "joint_l2_gpu_admission requires an L2-capable "
+                "offloading manager"
+            )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -295,6 +326,7 @@ class OffloadingConnectorScheduler:
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
+        self._pending_joint_l2_loads: dict[ReqId, PendingJointL2Load] = {}
         # GPU block IDs allocated in the current engine step
         self._current_batch_allocated_block_ids: set[int] = set()
         # if GPU prefix caching is enabled,
@@ -341,6 +373,62 @@ class OffloadingConnectorScheduler:
         if source == "shared":
             return "shared_l2"
         return "offload"
+
+    def _joint_lookup(
+        self,
+        key: OffloadKey,
+        req_status: RequestOffloadState,
+    ) -> bool | None:
+        result = self.manager.lookup_with_l1_pin_for_joint_admission(
+            key, req_status.req_context
+        )
+        if result is None:
+            req_status.lookup_blockers.add(
+                self._classify_deferred_lookup(key, req_status)
+            )
+        return result
+
+    def _joint_maximal_prefix_lookup(
+        self,
+        keys: Iterable[OffloadKey],
+        req_status: RequestOffloadState,
+    ) -> LookupResult:
+        """Return a provisional prefix while owned L2 blocks are in flight."""
+        hit_count = 0
+        deferred = False
+        for key in keys:
+            result = self._joint_lookup(key, req_status)
+            if result is None:
+                deferred = True
+                result = True
+            if not result:
+                break
+            hit_count += 1
+        return LookupResult(hit_count, deferred)
+
+    def _joint_sliding_window_lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        sliding_window_size: int,
+        req_status: RequestOffloadState,
+    ) -> LookupResult:
+        """Return a provisional sliding-window hit including owned L2."""
+        deferred = False
+        consecutive_hits = 0
+        for idx in range(len(keys) - 1, -1, -1):
+            result = self._joint_lookup(keys[idx], req_status)
+            if result is None:
+                deferred = True
+                result = True
+            if not result:
+                consecutive_hits = 0
+                continue
+            consecutive_hits += 1
+            if consecutive_hits == sliding_window_size:
+                return LookupResult(
+                    idx + sliding_window_size, deferred
+                )
+        return LookupResult(consecutive_hits, deferred)
 
     def _maximal_prefix_lookup(
         self, keys: Iterable[OffloadKey], req_status: RequestOffloadState
@@ -422,6 +510,7 @@ class OffloadingConnectorScheduler:
         happens until num_hit_tokens converges.
         """
         req_status.lookup_blockers.clear()
+        req_status.joint_l2_candidate = False
         num_computed_tokens = req_status.num_locally_computed_tokens
         max_hit_size_tokens: int = req_status.req.num_tokens
         if self._sliding_window_groups:
@@ -469,7 +558,21 @@ class OffloadingConnectorScheduler:
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
                 num_hit_blocks: int | None
-                if sliding_window_size_in_blocks is None:
+                if self.config.joint_l2_gpu_admission:
+                    if sliding_window_size_in_blocks is None:
+                        lookup_result = self._joint_maximal_prefix_lookup(
+                            offload_keys,
+                            req_status,
+                        )
+                    else:
+                        lookup_result = self._joint_sliding_window_lookup(
+                            offload_keys,
+                            sliding_window_size_in_blocks,
+                            req_status,
+                        )
+                    num_hit_blocks = lookup_result.value
+                    defer_lookup |= lookup_result.deferred
+                elif sliding_window_size_in_blocks is None:
                     num_hit_blocks = self._maximal_prefix_lookup(
                         offload_keys, req_status
                     )
@@ -509,7 +612,12 @@ class OffloadingConnectorScheduler:
                 looked_up_sliding_window |= sliding_window_size_in_blocks is not None
                 num_hit_tokens = new_num_hit_tokens
 
-        if defer_lookup:
+        joint_l2_candidate = (
+            defer_lookup
+            and num_hit_tokens > 0
+            and req_status.lookup_blockers == {"owned_l2"}
+        )
+        if defer_lookup and not joint_l2_candidate:
             logger.debug(
                 "Offloading manager delayed request %s as backend requested",
                 req_status.req.request_id,
@@ -543,6 +651,7 @@ class OffloadingConnectorScheduler:
                     )
                     return None
 
+        req_status.joint_l2_candidate = joint_l2_candidate
         logger.debug(
             "Request %s hit %s offloaded tokens after %s GPU hit tokens",
             req_status.req.request_id,
@@ -598,6 +707,14 @@ class OffloadingConnectorScheduler:
         if critical_path is not None:
             critical_path.finish_lookup_wait(lookup_start)
         num_hit_tokens = self._lookup(req_status)
+        if self.config.joint_l2_gpu_admission and not (
+            req_status.joint_l2_candidate
+        ):
+            # A provisional lookup may have tentatively allocated L1 slots
+            # and protected ready L1 blocks before a later block made the
+            # whole request ineligible. Do not retain that work without GPU
+            # admission.
+            self.manager.cancel_joint_l2_load(req_status.req_context)
         if critical_path is not None:
             lookup_elapsed_s = time.monotonic() - lookup_start
             take_synchronous_admission = getattr(
@@ -653,6 +770,46 @@ class OffloadingConnectorScheduler:
             )
 
         return num_hit_tokens, bool(num_hit_tokens)
+
+    def _enqueue_load_job(
+        self,
+        req_status: RequestOffloadState,
+        keys_to_load: Collection[OffloadKey],
+        src_spec: LoadStoreSpec,
+        dst_spec: GPULoadStoreSpec,
+    ) -> None:
+        load_job_id = self._generate_job_id()
+        self._current_batch_load_jobs[load_job_id] = TransferJob(
+            req_id=req_status.req.request_id,
+            transfer_spec=(src_spec, dst_spec),
+        )
+        # A load can only be issued when no other jobs are pending.
+        assert not req_status.transfer_jobs
+        req_status.transfer_jobs.add(load_job_id)
+        self._jobs[load_job_id] = TransferJobStatus(
+            req_id=req_status.req.request_id,
+            pending_count=self.config.num_workers,
+            keys=set(keys_to_load),
+            is_store=False,
+        )
+
+    def on_external_load_allocation_failed(self, request: Request) -> None:
+        """Roll back L1 promotion slots when joint GPU admission fails."""
+        req_status = self._req_status[request.request_id]
+        if not req_status.joint_l2_candidate:
+            return
+        self.manager.cancel_joint_l2_load(req_status.req_context)
+        req_status.joint_l2_candidate = False
+
+    def request_has_active_load(self, request: Request) -> bool:
+        """Return whether GPU blocks must wait for a worker load to finish."""
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            return False
+        return any(
+            not self._jobs[job_id].is_store
+            for job_id in req_status.transfer_jobs
+        )
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
@@ -728,28 +885,33 @@ class OffloadingConnectorScheduler:
             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
                 group_state.next_stored_block_idx = num_blocks
 
-        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
 
-        load_job_id = self._generate_job_id()
-        self._current_batch_load_jobs[load_job_id] = TransferJob(
-            req_id=request.request_id,
-            transfer_spec=(src_spec, dst_spec),
-        )
-        # a load can only be issued when no other jobs are pending.
-        assert not req_status.transfer_jobs
-        req_status.transfer_jobs.add(load_job_id)
-        self._jobs[load_job_id] = TransferJobStatus(
-            req_id=request.request_id,
-            pending_count=self.config.num_workers,
-            keys=set(keys_to_load),
-            is_store=False,
-        )
-
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
+
+        if req_status.joint_l2_candidate:
+            assert request.request_id not in self._pending_joint_l2_loads
+            self.manager.reserve_joint_l2_load(
+                keys_to_load, req_status.req_context
+            )
+            self._pending_joint_l2_loads[request.request_id] = (
+                PendingJointL2Load(
+                    keys=tuple(keys_to_load),
+                    dst_spec=dst_spec,
+                )
+            )
+            req_status.joint_l2_candidate = False
+            return
+
+        src_spec = self.manager.prepare_load(
+            keys_to_load, req_status.req_context
+        )
+        self._enqueue_load_job(
+            req_status, keys_to_load, src_spec, dst_spec
+        )
 
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
         """
@@ -977,11 +1139,30 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
+    def _dispatch_ready_joint_l2_loads(self) -> None:
+        """Start H2D jobs whose jointly admitted L2 promotions are ready."""
+        for req_id, pending in list(self._pending_joint_l2_loads.items()):
+            req_status = self._req_status[req_id]
+            src_spec = self.manager.try_prepare_joint_l2_load(
+                pending.keys, req_status.req_context
+            )
+            if src_spec is None:
+                continue
+
+            del self._pending_joint_l2_loads[req_id]
+            self._enqueue_load_job(
+                req_status,
+                pending.keys,
+                src_spec,
+                pending.dst_spec,
+            )
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         self._update_req_states(scheduler_output)
         self.manager.on_schedule_end()
+        self._dispatch_ready_joint_l2_loads()
 
         # Flush jobs for preempted requests.
         for req_id in scheduler_output.preempted_req_ids or ():
@@ -1110,6 +1291,16 @@ class OffloadingConnectorScheduler:
         req_context = (
             req_status.req_context if req_status else _create_req_context(request)
         )
+        pending_joint_load = self._pending_joint_l2_loads.pop(
+            request.request_id, None
+        )
+        if (
+            pending_joint_load is not None
+            and self._blocks_being_loaded is not None
+        ):
+            self._blocks_being_loaded.difference_update(
+                pending_joint_load.keys
+            )
         self.manager.on_request_finished(req_context)
 
         if req_status is None:

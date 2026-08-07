@@ -122,6 +122,7 @@ class MockOffloadingSpec(OffloadingSpec):
         self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
         self.manager.lookup.return_value = False
         self.manager.on_new_request.return_value = RequestOffloadingContext()
+        self.manager.supports_joint_l2_gpu_admission.return_value = True
         self.handler = MockOffloadingHandler()
 
     def get_manager(self) -> OffloadingManager:

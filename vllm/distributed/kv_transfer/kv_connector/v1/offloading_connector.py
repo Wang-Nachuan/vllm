@@ -144,6 +144,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             request, blocks, num_external_tokens
         )
 
+    def on_external_load_allocation_failed(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_external_load_allocation_failed(request)
+
+    def request_has_active_load(self, request: "Request") -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_has_active_load(request)
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:

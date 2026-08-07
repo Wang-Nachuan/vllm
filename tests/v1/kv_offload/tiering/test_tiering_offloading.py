@@ -255,6 +255,95 @@ class TestTieringOffloadingManager:
         # Next lookup should succeed
         assert count_hits(self.manager, blocks) == 3
 
+    def test_joint_l2_load_pins_completion_until_gpu_handoff(
+        self, manager_setup
+    ):
+        blocks = to_keys(range(2))
+        ctx = ReqContext(req_id="joint")
+        for block in blocks:
+            self.secondary_tier1.blocks[block] = True
+
+        assert all(self.manager.lookup(block, ctx) is None for block in blocks)
+        self.manager.reserve_joint_l2_load(blocks, ctx)
+        assert self.manager.try_prepare_joint_l2_load(blocks, ctx) is None
+
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        for key in blocks:
+            primary_block = self.primary_tier._policy.get(key)
+            assert primary_block is not None
+            assert primary_block.ref_cnt == 1
+
+        load_spec = self.manager.try_prepare_joint_l2_load(blocks, ctx)
+        assert load_spec is not None
+        for key in blocks:
+            primary_block = self.primary_tier._policy.get(key)
+            assert primary_block is not None
+            # The temporary joint pin was replaced by the GPU load reference.
+            assert primary_block.ref_cnt == 1
+
+        self.manager.complete_load(blocks, ctx)
+        for key in blocks:
+            primary_block = self.primary_tier._policy.get(key)
+            assert primary_block is not None
+            assert primary_block.ref_cnt == 0
+
+    def test_joint_l2_lookup_pins_l1_hits_before_promoting_later_blocks(
+        self, manager_setup
+    ):
+        ready_blocks = to_keys(range(5))
+        l2_block = to_keys([5])[0]
+        ctx = ReqContext(req_id="mixed-l1-l2")
+
+        primary_result = self.primary_tier.prepare_store(ready_blocks, ctx)
+        assert primary_result is not None
+        self.primary_tier.complete_store(ready_blocks, ctx, success=True)
+        self.secondary_tier1.blocks[l2_block] = True
+
+        assert (
+            self.manager.lookup_with_l1_pin_for_joint_admission(
+                ready_blocks[0], ctx
+            )
+            is True
+        )
+        pinned = self.primary_tier._policy.get(ready_blocks[0])
+        assert pinned is not None
+        assert pinned.ref_cnt == 1
+
+        assert (
+            self.manager.lookup_with_l1_pin_for_joint_admission(l2_block, ctx)
+            is None
+        )
+        assert self.primary_tier.lookup(ready_blocks[0], ctx) is True
+        assert self.primary_tier.lookup(ready_blocks[1], ctx) is False
+
+        self.manager.reserve_joint_l2_load(
+            [ready_blocks[0], l2_block], ctx
+        )
+        self.manager.cancel_joint_l2_load(ctx)
+
+        pinned = self.primary_tier._policy.get(ready_blocks[0])
+        assert pinned is not None
+        assert pinned.ref_cnt == 0
+        assert self.primary_tier.lookup(l2_block, ctx) is False
+
+    def test_joint_l2_load_cancels_before_submission(self, manager_setup):
+        block = to_keys([0])[0]
+        ctx = ReqContext(req_id="no-gpu-capacity")
+        self.secondary_tier1.blocks[block] = True
+        self.secondary_tier1.submit_load = MagicMock(
+            wraps=self.secondary_tier1.submit_load
+        )
+
+        assert self.manager.lookup(block, ctx) is None
+        assert self.primary_tier.lookup(block, ctx) is None
+        self.manager.cancel_joint_l2_load(ctx)
+        assert self.primary_tier.lookup(block, ctx) is False
+
+        self._simulate_on_schedule_end()
+        self.secondary_tier1.submit_load.assert_not_called()
+
     def test_partial_lookup(self, manager_setup):
         """Test lookup with partial hits."""
         blocks = to_keys(range(5))

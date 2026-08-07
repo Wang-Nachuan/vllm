@@ -265,6 +265,36 @@ class OffloadingManager(ABC):
         """
         return
 
+    def supports_joint_l2_gpu_admission(self) -> bool:
+        """Return whether L2 promotion can be coupled to GPU admission."""
+        return False
+
+    def lookup_with_l1_pin_for_joint_admission(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> bool | None:
+        """Lookup while protecting L1 hits during provisional L2 admission."""
+        return self.lookup(key, req_context)
+
+    def reserve_joint_l2_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        """Protect a jointly admitted load until L2 promotion completes."""
+        raise NotImplementedError
+
+    def try_prepare_joint_l2_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> LoadStoreSpec | None:
+        """Prepare L1-to-GPU loading once a joint L2 promotion is ready."""
+        raise NotImplementedError
+
+    def cancel_joint_l2_load(self, req_context: ReqContext) -> None:
+        """Cancel tentative joint-admission work for one request."""
+        return
+
     def reset_cache(self) -> None:
         """Evict all tracked blocks and reset internal state."""
         return

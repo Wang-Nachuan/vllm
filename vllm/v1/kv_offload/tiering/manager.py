@@ -77,6 +77,16 @@ class PendingPromotion:
     block_ids: list[int] = field(default_factory=list)
 
 
+@dataclass
+class JointL2LoadReservation:
+    """L1 blocks protected while a request already holds its GPU slots."""
+
+    req_context: ReqContext
+    keys: frozenset[OffloadKey]
+    pinned_keys: set[OffloadKey] = field(default_factory=set)
+    failed: bool = False
+
+
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     """CPUOffloadingManager with a primary/secondary transfer interface.
 
@@ -181,6 +191,10 @@ class TieringOffloadingManager(OffloadingManager):
             float
         )
         self._finished_promotion_owners: set[str] = set()
+        self._joint_l2_loads: dict[str, JointL2LoadReservation] = {}
+        self._joint_l2_lookup_pins: defaultdict[str, set[OffloadKey]] = defaultdict(
+            set
+        )
 
         # Pending promotion requests accumulated during lookup() calls; flushed
         # as one batched submit_load() per (tier, request) in on_schedule_end().
@@ -276,6 +290,27 @@ class TieringOffloadingManager(OffloadingManager):
                                 observed_at=observed_at,
                             )
                         )
+                        joint_load = self._joint_l2_loads.get(owner)
+                        if joint_load is not None:
+                            if completed_job.success:
+                                new_joint_pins = [
+                                    key
+                                    for key in job_metadata.keys
+                                    if key in joint_load.keys
+                                    and key not in joint_load.pinned_keys
+                                ]
+                                if new_joint_pins:
+                                    self.primary_tier.prepare_read(
+                                        new_joint_pins,
+                                        joint_load.req_context,
+                                    )
+                                    joint_load.pinned_keys.update(
+                                        new_joint_pins
+                                    )
+                            elif not set(job_metadata.keys).isdisjoint(
+                                joint_load.keys
+                            ):
+                                joint_load.failed = True
                     for key in job_metadata.keys:
                         if self._promotion_owners.get(key) == owner:
                             del self._promotion_owners[key]
@@ -332,6 +367,23 @@ class TieringOffloadingManager(OffloadingManager):
             return None
         return False
 
+    @override
+    def lookup_with_l1_pin_for_joint_admission(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> bool | None:
+        """Protect an L1 hit before later L2 promotions can evict it."""
+        result = self.lookup(key, req_context)
+        if result is True:
+            pinned_keys = self._joint_l2_lookup_pins[req_context.req_id]
+            if key not in pinned_keys:
+                self.primary_tier.prepare_read([key], req_context)
+                pinned_keys.add(key)
+        return result
+
+    @override
+    def supports_joint_l2_gpu_admission(self) -> bool:
+        return bool(self.secondary_tiers)
+
     def get_l2_promotion_wait_source(
         self, key: OffloadKey, req_context: ReqContext
     ) -> L2PromotionWaitSource | None:
@@ -354,6 +406,114 @@ class TieringOffloadingManager(OffloadingManager):
     def take_synchronous_l2_admission_s(self, req_context: ReqContext) -> float:
         """Return in-lookup L2-to-L1 admission work for this request once."""
         return self._synchronous_l2_admission_s.pop(req_context.req_id, 0.0)
+
+    def _release_joint_l2_pins(
+        self, reservation: JointL2LoadReservation
+    ) -> None:
+        if reservation.pinned_keys:
+            self.primary_tier.complete_read(
+                reservation.pinned_keys, reservation.req_context
+            )
+            reservation.pinned_keys.clear()
+
+    @override
+    def reserve_joint_l2_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        """Protect L1 hits and promotion results after GPU allocation."""
+        owner = req_context.req_id
+        assert owner not in self._joint_l2_loads
+        key_set = frozenset(keys)
+        assert key_set
+
+        lookup_pins = self._joint_l2_lookup_pins.pop(owner, set())
+        extra_lookup_pins = lookup_pins - key_set
+        if extra_lookup_pins:
+            self.primary_tier.complete_read(extra_lookup_pins, req_context)
+        retained_lookup_pins = lookup_pins & key_set
+        ready_keys: list[OffloadKey] = []
+        for key in key_set:
+            state = self.primary_tier.lookup(key, req_context)
+            if state is True:
+                if key not in retained_lookup_pins:
+                    ready_keys.append(key)
+                continue
+            assert state is None and self._promotion_owners.get(key) == owner, (
+                "Joint L2 admission requires every non-ready block to be "
+                f"owned by {owner!r}"
+            )
+
+        reservation = JointL2LoadReservation(
+            req_context=req_context,
+            keys=key_set,
+            pinned_keys=set(retained_lookup_pins),
+        )
+        if ready_keys:
+            self.primary_tier.prepare_read(ready_keys, req_context)
+            reservation.pinned_keys.update(ready_keys)
+        self._joint_l2_loads[owner] = reservation
+
+    @override
+    def try_prepare_joint_l2_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> LoadStoreSpec | None:
+        """Hand protected L1 blocks to an L1-to-GPU load when ready."""
+        self._maybe_process_finished_jobs()
+        owner = req_context.req_id
+        reservation = self._joint_l2_loads.get(owner)
+        assert reservation is not None
+        assert frozenset(keys) == reservation.keys
+        if reservation.failed:
+            raise RuntimeError(f"L2 promotion failed for request {owner!r}")
+
+        for key in keys:
+            state = self.primary_tier.lookup(key, req_context)
+            if state is None:
+                return None
+            if not state:
+                raise RuntimeError(
+                    "Jointly reserved L2 blocks disappeared for request "
+                    f"{owner!r}"
+                )
+
+        load_spec = self.primary_tier.prepare_load(keys, req_context)
+        self._release_joint_l2_pins(reservation)
+        del self._joint_l2_loads[owner]
+        return load_spec
+
+    @override
+    def cancel_joint_l2_load(self, req_context: ReqContext) -> None:
+        """Cancel promotions not yet submitted and release temporary pins."""
+        owner = req_context.req_id
+        reservation = self._joint_l2_loads.pop(owner, None)
+        if reservation is not None:
+            self._release_joint_l2_pins(reservation)
+
+        lookup_pins = self._joint_l2_lookup_pins.pop(owner, None)
+        if lookup_pins:
+            self.primary_tier.complete_read(lookup_pins, req_context)
+
+        cancelled_keys: set[OffloadKey] = set()
+        for tier, pending_by_owner in list(
+            self._pending_load_submissions.items()
+        ):
+            pending = pending_by_owner.pop(owner, None)
+            if pending is not None:
+                cancelled_keys.update(pending.keys)
+            if not pending_by_owner:
+                del self._pending_load_submissions[tier]
+
+        if cancelled_keys:
+            self.primary_tier.complete_write(
+                cancelled_keys, req_context, success=False
+            )
+            for key in cancelled_keys:
+                if self._promotion_owners.get(key) == owner:
+                    del self._promotion_owners[key]
 
     def _initiate_promotion(
         self,
@@ -654,6 +814,7 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
+        self.cancel_joint_l2_load(req_context)
         if req_context.req_id in self._promotion_owners.values():
             self._finished_promotion_owners.add(req_context.req_id)
         self.primary_tier.on_request_finished(req_context)

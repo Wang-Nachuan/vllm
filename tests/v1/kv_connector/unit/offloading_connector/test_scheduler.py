@@ -8,11 +8,15 @@ import pytest
 import torch
 
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
+    MockLoadStoreSpec,
     generate_store_output,
     to_keys,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingConnectorMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
@@ -168,6 +172,120 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     assert isinstance(event, BlockRemoved)
     assert event.block_hashes == to_hashes([4, 5, 6])
     assert event.medium == "B"
+
+
+def test_joint_l2_admission_reserves_gpu_before_h2d(request_runner):
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        extra_config_overrides={
+            "joint_l2_gpu_admission": True,
+        },
+    )
+    runner.connector_scheduler._classify_deferred_lookup = (
+        lambda key, req_status: "owned_l2"
+    )
+    runner.manager.lookup_with_l1_pin_for_joint_admission.return_value = None
+    attempts = 0
+
+    def try_prepare(keys, req_context):
+        nonlocal attempts
+        attempts += 1
+        return None if attempts == 1 else MockLoadStoreSpec(keys)
+
+    runner.manager.try_prepare_joint_l2_load.side_effect = try_prepare
+    runner.new_request(token_ids=[0] * 4)
+
+    first_output = runner.scheduler.schedule()
+    first_meta = first_output.kv_connector_metadata
+    assert isinstance(first_meta, OffloadingConnectorMetadata)
+    assert not first_meta.load_jobs
+    assert runner.scheduler.requests["0"].status == (
+        RequestStatus.WAITING_FOR_REMOTE_KVS
+    )
+    assert set(runner.connector_scheduler._pending_joint_l2_loads) == {"0"}
+    runner.manager.reserve_joint_l2_load.assert_called_once()
+
+    second_output = runner.scheduler.schedule()
+    second_meta = second_output.kv_connector_metadata
+    assert isinstance(second_meta, OffloadingConnectorMetadata)
+    assert len(second_meta.load_jobs) == 1
+    assert not runner.connector_scheduler._pending_joint_l2_loads
+
+
+def test_joint_l2_admission_rolls_back_when_gpu_allocation_fails(
+    request_runner,
+):
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=2,
+        async_scheduling=False,
+        extra_config_overrides={
+            "joint_l2_gpu_admission": True,
+        },
+    )
+    runner.connector_scheduler._classify_deferred_lookup = (
+        lambda key, req_status: "owned_l2"
+    )
+    runner.manager.lookup_with_l1_pin_for_joint_admission.return_value = None
+    runner.new_request(token_ids=[0] * 8)
+
+    output = runner.scheduler.schedule()
+    meta = output.kv_connector_metadata
+    assert isinstance(meta, OffloadingConnectorMetadata)
+    assert not meta.load_jobs
+    assert not runner.connector_scheduler._pending_joint_l2_loads
+    runner.manager.reserve_joint_l2_load.assert_not_called()
+    runner.manager.cancel_joint_l2_load.assert_called_once()
+
+
+def test_joint_l2_admission_abort_releases_reserved_gpu(request_runner):
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        extra_config_overrides={
+            "joint_l2_gpu_admission": True,
+        },
+    )
+    runner.connector_scheduler._classify_deferred_lookup = (
+        lambda key, req_status: "owned_l2"
+    )
+    runner.manager.lookup_with_l1_pin_for_joint_admission.return_value = None
+    runner.manager.try_prepare_joint_l2_load.return_value = None
+    runner.new_request(token_ids=[0] * 4)
+
+    runner.scheduler.schedule()
+    assert set(runner.connector_scheduler._pending_joint_l2_loads) == {"0"}
+
+    runner.scheduler.finish_requests(("0",), RequestStatus.FINISHED_ABORTED)
+
+    assert "0" not in runner.scheduler.requests
+    assert not runner.connector_scheduler._pending_joint_l2_loads
+    runner.manager.on_request_finished.assert_called_once()
+
+
+def test_joint_l2_admission_releases_lookup_pins_for_l1_only_hit(
+    request_runner,
+):
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        extra_config_overrides={
+            "joint_l2_gpu_admission": True,
+        },
+    )
+    runner.manager.lookup_with_l1_pin_for_joint_admission.return_value = True
+    runner.new_request(token_ids=[0] * 4)
+
+    output = runner.scheduler.schedule()
+    meta = output.kv_connector_metadata
+    assert isinstance(meta, OffloadingConnectorMetadata)
+    assert len(meta.load_jobs) == 1
+    runner.manager.cancel_joint_l2_load.assert_called_once()
+    runner.manager.reserve_joint_l2_load.assert_not_called()
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

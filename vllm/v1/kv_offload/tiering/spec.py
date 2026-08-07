@@ -11,6 +11,8 @@ Configuration via kv_connector_extra_config:
   - block_size: (optional) Block size for offloaded blocks (default: GPU block size)
   - eviction_policy: (optional) Primary tier eviction policy: "lru" or
     "arc" (default: "lru")
+  - joint_l2_gpu_admission: (optional) Reserve GPU KV before an L2 promotion
+    enters the asynchronous completion queue (default: false)
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "storage", "network")

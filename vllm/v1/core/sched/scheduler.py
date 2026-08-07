@@ -794,6 +794,14 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if load_kv_async and self.connector is not None:
+                        allocation_failed = getattr(
+                            self.connector,
+                            "on_external_load_allocation_failed",
+                            None,
+                        )
+                        if allocation_failed is not None:
+                            allocation_failed(request)
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1947,8 +1955,18 @@ class Scheduler(SchedulerInterface):
         for request in valid_requests:
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                request_has_active_load = getattr(
+                    self.connector, "request_has_active_load", None
+                )
+                active_load = (
+                    request_has_active_load(request)
+                    if request_has_active_load is not None
+                    else True
+                )
                 delay_free_blocks = (
-                    request.request_id not in self.finished_recving_kv_req_ids
+                    active_load
+                    and request.request_id
+                    not in self.finished_recving_kv_req_ids
                 )
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
